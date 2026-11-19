@@ -1,5 +1,6 @@
 export default defineNuxtConfig({
   ssr: false,
+  vite: { optimizeDeps: { include: ['@huggingface/transformers', 'onnxruntime-web/wasm'] } },
   css: ['~/assets/main.css'],
   app: {
     head: {

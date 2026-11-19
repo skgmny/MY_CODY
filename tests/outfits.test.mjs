@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { avatarShape, orderedItems, recommendation, resolveItems } from '../app/utils/outfits.ts'
+import { orderedItems, recommendation, resolveItems } from '../app/utils/outfits.ts'
 
 const item = (id, category, tags = []) => ({ id, category, tags })
 const clothes = [
@@ -34,15 +34,6 @@ test('tagless recommendations traverse all combinations once and stop', () => {
   assert.equal(new Set(combinations).size, 12)
   assert.equal(session.at(session.total), undefined)
   assert.equal(session.at(-1), undefined)
-})
-
-test('avatar accepts finite positive measurements and varies each dimension', () => {
-  for (const invalid of [0, -1, NaN, Infinity]) {
-    assert.equal(avatarShape(170, invalid), undefined)
-    assert.equal(avatarShape(invalid, 60), undefined)
-  }
-  assert.ok(avatarShape(185, 60).height > avatarShape(160, 60).height)
-  assert.ok(avatarShape(170, 80).width > avatarShape(170, 60).width)
 })
 
 test('saved references preserve a deleted slot while resolving remaining items', () => {

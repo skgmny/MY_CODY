@@ -12,15 +12,20 @@ export type Item = {
   name: string
   tags: Tag[]
   original: Blob
+  cutout?: Blob
   photo: Blob
   crop?: Crop
-  wear?: Blob
   created: number
   modified: number
 }
 export type Look = { ids: Selection; situation: Tag | ''; mode: 'recommend' | 'manual' }
 export type SavedLook = Look & { id: string; saved: number }
-export type Avatar = { height: number; weight: number; modified: number }
+
+export function outfitPhoto(item: Pick<Item, 'original' | 'cutout' | 'photo' | 'crop'>) {
+  const crop = item.crop
+  if (crop && (crop.zoom !== 1 || crop.x !== 50 || crop.y !== 50)) return item.photo
+  return item.cutout ?? item.original
+}
 
 export function recommendation<T extends Pick<Item, 'id' | 'category' | 'tags'>>(items: T[], situation: Tag | '') {
   const groups = categories.map(category => {
@@ -52,14 +57,4 @@ export function orderedItems(items: Item[], category: Category, situation: Tag |
 
 export function resolveItems<T extends Pick<Item, 'id'>>(items: T[], ids: Selection) {
   return categories.map(category => ({ category, item: items.find(item => item.id === ids[category]) }))
-}
-
-export function avatarShape(height: number, weight: number) {
-  if (![height, weight].every(value => Number.isFinite(value) && value > 0)) return
-  const bounded = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
-  const bmi = weight / (height / 100) ** 2
-  return {
-    height: bounded(height / 170, 0.65, 1.17),
-    width: bounded(Number.isNaN(bmi) ? 1 : 1 + (bmi - 22) / 65, 0.7, 1.36),
-  }
 }

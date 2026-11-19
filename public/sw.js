@@ -25,9 +25,9 @@ self.addEventListener('activate', event => {
 
 function stageImage(file, id) {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open('oneday-closet', 1)
+    const request = indexedDB.open('oneday-closet')
     request.onupgradeneeded = () => {
-      for (const name of ['items', 'looks', 'settings', 'inbox']) request.result.createObjectStore(name)
+      for (const name of ['items', 'looks', 'inbox']) request.result.createObjectStore(name)
     }
     request.onerror = () => reject(request.error)
     request.onsuccess = () => {

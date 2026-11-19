@@ -1,24 +1,27 @@
 <script setup lang="ts">
-import { ArrowDown, ArrowLeft, ArrowRight, Bookmark, Camera, ChevronRight, Heart, House, ImagePlus,
-  Layers3, Plus, ScanLine, Shirt, Sparkles, Upload, UserRound } from 'lucide-vue-next'
-import { avatarShape, categories, labels, orderedItems, recommendation, resolveItems, tags,
-  type Avatar, type Category, type Item, type Look, type SavedLook, type Selection, type Tag } from '~/utils/outfits'
-import { read, readAll, remove, write } from '~/utils/storage'
-import { cropPhoto, defaultCrop, validateWear } from '~/utils/images'
+import { ArrowLeft, ArrowRight, Bookmark, Camera, ChevronRight, Heart, House, ImagePlus,
+  Layers3, Plus, Shirt, Sparkles } from 'lucide-vue-next'
+import { categories, labels, orderedItems, outfitPhoto, recommendation, resolveItems, tags,
+  type Category, type Item, type Look, type SavedLook, type Selection, type Tag } from '~/utils/outfits'
+import { read, readAll, remove, write, writeItems } from '~/utils/storage'
+import { cropPhoto, defaultCrop } from '~/utils/images'
 
-type Screen = 'home' | 'wardrobe' | 'item' | 'recommend' | 'manual' | 'preview' | 'saved' | 'avatar'
+type Screen = 'home' | 'wardrobe' | 'item' | 'recommend' | 'manual' | 'preview' | 'saved'
 const nav = [{ id: 'home', label: '홈', icon: House }, { id: 'wardrobe', label: '내 옷장', icon: Shirt },
   { id: 'saved', label: '저장 코디', icon: Bookmark }] as const
 const titles: Record<Screen, string> = {
   home: '홈', wardrobe: '내 옷장', item: '옷 등록', recommend: '코디 추천', manual: '직접 코디',
-  preview: '코디 미리보기', saved: '저장 코디', avatar: '아바타 설정',
+  preview: '코디 미리보기', saved: '저장 코디',
 }
 const screen = ref<Screen>('home')
 const trail = ref<Screen[]>([])
 const main = ref<HTMLElement>()
 const items = shallowRef<Item[]>([])
 const saved = shallowRef<SavedLook[]>([])
-const avatar = shallowRef<Avatar>()
+const savedFilter = ref<Tag | '' | 'all'>('all')
+const visibleSaved = computed(() => savedFilter.value === 'all'
+  ? saved.value
+  : saved.value.filter(look => look.situation === savedFilter.value))
 const ready = ref(false)
 const loadError = ref('')
 const error = ref('')
@@ -30,14 +33,19 @@ const category = ref<Category | ''>('')
 const name = ref('')
 const selectedTags = ref<Tag[]>([])
 const original = shallowRef<Blob>()
+const cutout = shallowRef<Blob>()
 const photo = shallowRef<Blob>()
-const wear = shallowRef<Blob>()
 const crop = ref(defaultCrop())
+const appliedCrop = shallowRef(defaultCrop())
 const cropping = ref(false)
 const processing = ref(false)
-const checkingWear = ref(false)
+const replacingPhoto = ref(false)
+const photoError = ref('')
+const photoNotes = ref<string[]>([])
+const analysis = shallowRef<AbortController>()
+type BatchPhoto = { file: File; photo?: Blob; originalPreview?: Blob; cutout?: Blob; category: Category | ''; tags: Tag[]; notes?: string[]; error?: string }
+const batch = ref<BatchPhoto[]>([])
 let photoVersion = 0
-let wearVersion = 0
 const shareHint = ref('')
 const recommendedSituation = ref<Tag | ''>('')
 const situation = ref<Tag | ''>('')
@@ -46,27 +54,26 @@ const started = ref(false)
 const session = shallowRef<ReturnType<typeof recommendation<Item>>>()
 const emptySelection = (): Selection => ({ top: '', bottom: '', shoes: '' })
 const selection = ref(emptySelection())
-const activeCategory = ref<Category>('top')
 const preview = shallowRef<Look | SavedLook>()
-const wearing = ref(false)
-const avatarReturn = ref<Screen>('home')
-const height = ref<string | number>('')
-const weight = ref<string | number>('')
 
-const recent = computed(() => saved.value.slice(0, 3))
+const recent = computed(() => saved.value.slice(0, 2))
 const wardrobe = computed(() => items.value.filter(item => filter.value === 'all' || item.category === filter.value))
 const currentIds = computed(() => session.value?.at(index.value))
 const suggested = computed<Look | undefined>(() => currentIds.value
   ? { ids: currentIds.value, situation: recommendedSituation.value, mode: 'recommend' } : undefined)
-const manual = computed<Look>(() => ({ ids: { ...selection.value }, situation: situation.value, mode: 'manual' }))
-const manualOptions = computed(() => orderedItems(items.value, activeCategory.value, situation.value))
-const complete = computed(() => resolveItems(items.value, selection.value).every(({ item }) => item))
+const manualRows = computed(() => categories.map(kind => {
+  const options = orderedItems(items.value, kind, situation.value)
+  const index = Math.max(0, options.findIndex(item => item.id === selection.value[kind]))
+  return { kind, options, index, item: options[index] }
+}))
+const manual = computed<Look>(() => {
+  const ids = emptySelection()
+  for (const row of manualRows.value) ids[row.kind] = row.item?.id ?? ''
+  return { ids, situation: situation.value, mode: 'manual' }
+})
+const complete = computed(() => manualRows.value.every(row => row.item))
 const missingCategories = computed(() => categories.filter(kind => !items.value.some(item => item.category === kind)))
-const pieces = computed(() => preview.value ? resolveItems(items.value, preview.value.ids) : [])
-const missingWear = computed(() => pieces.value.filter(({ item }) => !item?.wear).map(({ category }) => labels[category]))
 const savedPreview = computed(() => preview.value && 'id' in preview.value ? preview.value : undefined)
-const draftShape = computed(() => avatarShape(Number(height.value), Number(weight.value)))
-const savedShape = computed(() => avatar.value && avatarShape(avatar.value.height, avatar.value.weight))
 
 function show(next: Screen, tab = false) {
   if (busy.value) return
@@ -91,10 +98,9 @@ function back() {
 async function initialize() {
   loadError.value = ''
   try {
-    const [clothes, looks, profile] = await Promise.all([readAll('items'), readAll('looks'), read('settings', 'avatar')])
+    const [clothes, looks] = await Promise.all([readAll('items'), readAll('looks')])
     items.value = clothes.sort((a, b) => b.created - a.created)
     saved.value = looks.sort((a, b) => b.saved - a.saved)
-    avatar.value = profile
     ready.value = true
   } catch {
     loadError.value = '이 브라우저에서 옷장 데이터를 열 수 없어요. 저장 공간 설정을 확인해 주세요.'
@@ -129,39 +135,87 @@ onMounted(() => {
 })
 
 function openItem(item?: Item, kind?: Category) {
+  analysis.value?.abort()
+  analysis.value = undefined
   photoVersion++
-  wearVersion++
   processing.value = false
-  checkingWear.value = false
+  replacingPhoto.value = false
+  photoError.value = ''
+  photoNotes.value = []
+  batch.value = []
   editId.value = item?.id ?? ''
   category.value = item?.category ?? kind ?? ''
   name.value = item?.name ?? ''
   selectedTags.value = [...(item?.tags ?? [])]
   original.value = item?.original
+  cutout.value = item?.cutout
   photo.value = item?.photo
-  wear.value = item?.wear
-  crop.value = item?.crop ? { ...item.crop } : defaultCrop()
+  appliedCrop.value = item?.crop ? { ...item.crop } : defaultCrop()
+  crop.value = { ...appliedCrop.value }
   cropping.value = false
   shareHint.value = ''
   show('item')
+}
+
+async function suggestPhoto(file: Blob, signal: AbortSignal) {
+  if (signal.aborted) return
+  let stop: () => void = () => {}
+  const cancelled = new Promise<undefined>(resolve => {
+    stop = () => resolve(undefined)
+    signal.addEventListener('abort', stop, { once: true })
+  })
+  try {
+    const task = import('~/utils/auto-photo').then(({ analyzePhoto }) => analyzePhoto(file, signal))
+    return await Promise.race([task, cancelled])
+  } catch {
+    if (!signal.aborted) return { cutout: undefined, category: '' as const, tags: [], notes: ['자동 처리를 불러오지 못했어요. 직접 선택해 주세요.'] }
+  } finally {
+    signal.removeEventListener('abort', stop)
+  }
 }
 
 async function setPhoto(file: Blob) {
   const version = ++photoVersion
   const defaults = defaultCrop()
   processing.value = true
-  error.value = ''
+  replacingPhoto.value = true
+  photoError.value = ''
+  photoNotes.value = []
   try {
     const result = await cropPhoto(file, defaults)
     if (version !== photoVersion) return
     original.value = file
-    crop.value = defaults
+    cutout.value = undefined
+    appliedCrop.value = defaults
+    crop.value = { ...defaults }
     photo.value = result
     cropping.value = false
+    const controller = new AbortController()
+    analysis.value = controller
+    const suggestion = await suggestPhoto(file, controller.signal)
+    if (version !== photoVersion || !suggestion) return
+    photoNotes.value = suggestion.notes
+    if (suggestion.cutout) {
+      const transparent = await cropPhoto(suggestion.cutout, defaults)
+      if (version !== photoVersion || controller.signal.aborted) return
+      cutout.value = suggestion.cutout
+      photo.value = transparent
+    }
+    if (!editId.value && !controller.signal.aborted) {
+      if (suggestion.category) category.value = suggestion.category
+      selectedTags.value = [...new Set([...selectedTags.value, ...suggestion.tags])]
+    }
   } catch (cause) {
-    if (version === photoVersion) error.value = (cause as Error).message
+    if (version === photoVersion) {
+      analysis.value = undefined
+      crop.value = { ...appliedCrop.value }
+      photoError.value = (cause as Error).message
+    }
   } finally {
-    if (version === photoVersion) processing.value = false
+    if (version === photoVersion) {
+      processing.value = false
+      replacingPhoto.value = false
+    }
   }
 }
 
@@ -177,36 +231,89 @@ async function changePhoto(event: Event) {
   if (file) await setPhoto(file)
 }
 
-async function changeWear(event: Event) {
-  const file = fileFrom(event)
-  if (!file) return
-  const version = ++wearVersion
-  checkingWear.value = true
+async function choosePhotos(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  input.value = ''
+  if (!files.length) return
+  if (files.length === 1 && !batch.value.length) {
+    await setPhoto(files[0]!)
+    return
+  }
+  const version = ++photoVersion
   error.value = ''
+  processing.value = true
+  replacingPhoto.value = true
+  const start = batch.value.length
+  const controller = new AbortController()
+  analysis.value = controller
+  batch.value.push(...files.map(file => ({ file, category: category.value, tags: [] })))
   try {
-    await validateWear(file)
-    if (version === wearVersion) wear.value = file
-  } catch (cause) {
-    if (version === wearVersion) error.value = (cause as Error).message
+    for (const row of batch.value.slice(start)) {
+      if (version !== photoVersion) return
+      try {
+        row.photo = await cropPhoto(row.file, defaultCrop())
+      } catch (cause) {
+        row.error = (cause as Error).message
+        continue
+      }
+      const suggestion = await suggestPhoto(row.file, controller.signal)
+      if (version !== photoVersion) return
+      if (!suggestion) continue
+      row.notes = suggestion.notes
+      row.category = suggestion.category || row.category
+      row.tags = suggestion.tags
+      if (suggestion.cutout) {
+        try {
+          const transparent = await cropPhoto(suggestion.cutout, defaultCrop())
+          if (controller.signal.aborted) continue
+          row.originalPreview = row.photo
+          row.cutout = suggestion.cutout
+          row.photo = transparent
+        } catch {
+          row.notes.push('투명 사진을 만들지 못해 원본을 사용했어요.')
+        }
+      }
+    }
   } finally {
-    if (version === wearVersion) checkingWear.value = false
+    if (version === photoVersion) {
+      analysis.value = undefined
+      processing.value = false
+      replacingPhoto.value = false
+    }
   }
 }
 
 async function adjustCrop() {
-  const file = original.value
-  if (!file) return
+  const file = cutout.value ?? original.value
+  if (!file || replacingPhoto.value) return
   const version = ++photoVersion
+  const nextCrop = { ...crop.value }
   processing.value = true
-  error.value = ''
+  photoError.value = ''
   try {
-    const result = await cropPhoto(file, { ...crop.value })
-    if (version === photoVersion) photo.value = result
+    const result = await cropPhoto(file, nextCrop)
+    if (version === photoVersion) {
+      photo.value = result
+      appliedCrop.value = nextCrop
+    }
   } catch (cause) {
-    if (version === photoVersion) error.value = (cause as Error).message
+    if (version === photoVersion) {
+      crop.value = { ...appliedCrop.value }
+      photoError.value = (cause as Error).message
+    }
   } finally {
     if (version === photoVersion) processing.value = false
   }
+}
+
+async function useOriginalPhoto() {
+  if (!original.value) return
+  const source = cutout.value
+  const version = photoVersion + 1
+  cutout.value = undefined
+  await adjustCrop()
+  if (version === photoVersion && photoError.value) cutout.value = source
 }
 
 async function commit(action: () => Promise<void>, success: string, next?: () => void) {
@@ -226,7 +333,7 @@ async function commit(action: () => Promise<void>, success: string, next?: () =>
 }
 
 async function saveItem() {
-  if (processing.value || checkingWear.value) return
+  if (processing.value) return
   if (!original.value || !photo.value || !category.value) {
     error.value = '사진과 품목 종류를 선택해 주세요.'
     return
@@ -234,13 +341,35 @@ async function saveItem() {
   const existing = items.value.find(item => item.id === editId.value)
   const now = Date.now()
   const item: Item = { id: existing?.id ?? crypto.randomUUID(), category: category.value, name: name.value.trim(),
-    tags: [...selectedTags.value], original: original.value, photo: photo.value, crop: { ...crop.value }, wear: wear.value,
+    tags: [...selectedTags.value], original: original.value, cutout: cutout.value, photo: photo.value, crop: { ...appliedCrop.value },
     created: existing?.created ?? now, modified: now }
   await commit(async () => {
     await write('items', item.id, item)
     items.value = existing ? items.value.map(old => old.id === item.id ? item : old) : [item, ...items.value]
-    filter.value = 'all'
+    if (trail.value.at(-1) === 'wardrobe' && filter.value !== 'all') filter.value = item.category
   }, '옷장에 저장했어요.', () => {
+    if (session.value && !session.value.total) recommend(recommendedSituation.value)
+    back()
+  })
+}
+
+async function saveBatch() {
+  if (processing.value || !batch.value.length) return
+  const now = Date.now()
+  const entries: Item[] = []
+  for (const row of batch.value) {
+    if (!row.photo || !row.category) {
+      error.value = '모든 사진의 종류를 선택하고, 열 수 없는 사진은 목록에서 빼 주세요.'
+      return
+    }
+    entries.push({ id: crypto.randomUUID(), category: row.category, name: '', tags: [...row.tags],
+      original: row.file, cutout: row.cutout, photo: row.photo, crop: defaultCrop(), created: now, modified: now })
+  }
+  await commit(async () => {
+    await writeItems(entries)
+    items.value = [...entries, ...items.value]
+    filter.value = 'all'
+  }, `옷 ${entries.length}벌을 저장했어요.`, () => {
     if (session.value && !session.value.total) recommend(recommendedSituation.value)
     back()
   })
@@ -270,46 +399,22 @@ function recommend(tag: Tag | '') {
   started.value = true
 }
 
-function startManual(look?: Look, kind: Category = 'top') {
+function startManual(look?: Look, kind?: Category) {
   situation.value = look?.situation ?? ''
   selection.value = look ? { ...look.ids } : emptySelection()
-  activeCategory.value = kind
   show('manual')
+  if (kind) nextTick(() => document.getElementById('manual-' + kind)?.scrollIntoView({ block: 'center' }))
 }
 
-function openPreview(look: Look | SavedLook, showAvatar = false) {
+function changeManualItem(row: typeof manualRows.value[number], direction: -1 | 1) {
+  const next = (row.index + direction + row.options.length) % row.options.length
+  const item = row.options[next]
+  if (item) selection.value[row.kind] = item.id
+}
+
+function openPreview(look: Look | SavedLook) {
   preview.value = look
-  wearing.value = showAvatar
   show('preview')
-  if (showAvatar && !avatar.value) openAvatar('preview')
-}
-
-function openAvatar(returnTo: Screen) {
-  if (returnTo === 'avatar') return
-  avatarReturn.value = returnTo
-  height.value = avatar.value?.height ?? ''
-  weight.value = avatar.value?.weight ?? ''
-  show('avatar')
-}
-
-function toggleAvatar() {
-  wearing.value = true
-  if (!avatar.value) openAvatar('preview')
-}
-
-async function saveAvatar() {
-  if (!draftShape.value) {
-    error.value = '키와 몸무게에 0보다 큰 숫자를 입력해 주세요.'
-    return
-  }
-  const profile = { height: Number(height.value), weight: Number(weight.value), modified: Date.now() }
-  await commit(async () => {
-    await write('settings', 'avatar', profile)
-    avatar.value = profile
-  }, '아바타를 저장했어요.', () => {
-    if (trail.value.at(-1) === avatarReturn.value) back()
-    else show(avatarReturn.value, true)
-  })
 }
 
 async function saveLook(look: Look) {
@@ -341,9 +446,6 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
     <div class="frame header-inner">
       <button type="button" class="brand" @click="show('home', true)">
         <span class="brand-icon"><Shirt :size="19" /></span> 오늘의 옷장
-      </button>
-      <button v-if="ready" type="button" class="icon-button profile" aria-label="아바타 설정" @click="openAvatar(screen)">
-        <UserRound :size="20" />
       </button>
     </div>
   </header>
@@ -377,11 +479,6 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
               <span><strong>직접 코디하기</strong><small>옷장에서 마음에 드는 조합을 골라보세요.</small></span>
               <ChevronRight :size="19" class="chevron" />
             </button>
-            <button class="feature" @click="openAvatar('home')">
-              <span class="feature-icon lilac"><ScanLine :size="23" /></span>
-              <span><strong>{{ avatar ? '내 아바타 수정하기' : '내 아바타 만들기' }}</strong><small>2D 아바타로 착용 모습을 확인해요.</small></span>
-              <ChevronRight :size="19" class="chevron" />
-            </button>
           </section>
           <section>
             <div class="section-heading"><h2>내 옷장</h2><button class="text-button" @click="show('wardrobe', true)">옷장 보기 <ChevronRight :size="16" /></button></div>
@@ -395,11 +492,13 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
           </section>
         </div>
         <section v-if="recent.length">
-          <div class="section-heading"><h2>최근 저장한 코디</h2><button class="text-button" @click="show('saved', true)">모두 보기 <ChevronRight :size="16" /></button></div>
-          <div class="saved-grid">
-            <article v-for="look in recent" :key="look.id" class="panel">
-              <LookCard :items="items" :look="look" />
-              <button class="text-button" @click="openPreview(look)">{{ look.situation || '나의 코디' }} 보기 <ArrowRight :size="16" /></button>
+          <div class="section-heading"><h2>최근 저장한 코디</h2><button class="text-button" @click="savedFilter = 'all'; show('saved', true)">모두 보기 <ChevronRight :size="16" /></button></div>
+          <div class="saved-list recent-list">
+            <article v-for="look in recent" :key="look.id" class="saved-entry">
+              <h3><button class="saved-entry-open" @click="openPreview(look)">{{ look.situation || '나의 코디' }}
+                <ChevronRight :size="18" aria-hidden="true" />
+              </button></h3>
+              <LookCard :items="items" :look="look" vertical photo-first />
             </article>
           </div>
         </section>
@@ -421,7 +520,7 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
         </div>
         <div v-else class="wardrobe-grid">
           <button v-for="item in wardrobe" :key="item.id" class="piece" @click="openItem(item)">
-            <BlobPhoto :blob="item.photo" :alt="item.name || labels[item.category]" />
+            <BlobPhoto :blob="outfitPhoto(item)" :alt="item.name || labels[item.category]" />
             <span>{{ labels[item.category] }}</span><strong>{{ item.name || labels[item.category] }}</strong>
           </button>
         </div>
@@ -429,16 +528,51 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
 
       <section v-else-if="screen === 'item'" class="narrow">
         <h1>{{ editId ? '옷 수정' : '옷 등록' }}</h1>
-        <form class="form-stack" @submit.prevent="saveItem">
-          <fieldset :disabled="busy">
+        <div v-if="analysis && !analysis.signal.aborted" class="inline-hint" role="status">
+          배경과 품목을 확인하고 있어요. 처음에는 모델을 내려받느라 시간이 걸릴 수 있어요.
+          <button type="button" class="text-button" @click="analysis.abort()">직접 입력하기</button>
+        </div>
+        <form v-if="batch.length" class="form-stack" @submit.prevent="saveBatch">
+          <p class="hint">사진마다 종류와 상황 태그를 확인하세요. 별칭과 사진 자르기는 등록 후 옷장에서 수정할 수 있어요.</p>
+          <p v-if="processing" class="hint" role="status">사진을 처리하고 있어요…</p>
+          <fieldset v-for="(row, i) in batch" :key="row.file.name + ':' + i" :disabled="busy || processing">
+            <legend>사진 {{ i + 1 }}</legend>
+            <BlobPhoto v-if="row.photo" class="batch-preview" :blob="row.photo" :alt="row.file.name" />
+            <p v-if="row.error" class="error" role="alert">{{ row.file.name }} · {{ row.error }}</p>
+            <p v-for="note in row.notes" :key="note" class="hint">{{ note }}</p>
+            <button v-if="row.cutout" class="text-button" type="button" @click="row.photo = row.originalPreview; row.cutout = undefined">원본 배경 사용</button>
+            <label class="field">품목 종류
+              <select v-model="row.category" required :aria-label="'사진 ' + (i + 1) + ' 품목 종류'">
+                <option value="" disabled>종류 선택</option>
+                <option v-for="kind in categories" :key="kind" :value="kind">{{ labels[kind] }}</option>
+              </select>
+            </label>
+            <div class="chips" :aria-label="'사진 ' + (i + 1) + ' 상황 태그'">
+              <label v-for="tag in tags" :key="tag" class="chip tag"><input v-model="row.tags" type="checkbox" :value="tag">{{ tag }}</label>
+            </div>
+            <button class="text-button" type="button" :aria-label="'사진 ' + (i + 1) + ' 제외'" @click="batch.splice(i, 1)">목록에서 빼기</button>
+          </fieldset>
+          <div class="actions uploads">
+            <label class="button outline small"><ImagePlus :size="18" /> 사진 더 선택<input class="file-input" aria-label="사진 더 선택" type="file" accept="image/*" multiple :disabled="busy || processing" @change="choosePhotos"></label>
+            <button class="button" type="submit" :disabled="busy || processing">옷 {{ batch.length }}벌 한 번에 저장</button>
+          </div>
+        </form>
+        <form v-else class="form-stack" @submit.prevent="saveItem">
+          <fieldset :disabled="busy || replacingPhoto">
             <legend>옷 사진</legend>
             <BlobPhoto v-if="photo" class="crop-preview" :blob="photo" alt="저장할 옷 사진 미리보기" />
             <div class="actions uploads">
-              <label class="button outline small"><ImagePlus :size="18" /> 사진 보관함<input class="file-input" aria-label="사진 보관함" type="file" accept="image/*" @change="changePhoto"></label>
+              <label class="button outline small"><ImagePlus :size="18" /> 사진 보관함<input class="file-input" aria-label="사진 보관함" type="file" accept="image/*" :multiple="!editId && !photo" @change="choosePhotos"></label>
               <label class="button outline small"><Camera :size="18" /> 카메라<input class="file-input" aria-label="카메라" type="file" accept="image/*" capture="environment" @change="changePhoto"></label>
               <button v-if="photo" class="button outline small" type="button" :aria-expanded="cropping" @click="cropping = !cropping">{{ cropping ? '자르기 닫기' : '사진 자르기' }}</button>
+              <button v-if="cutout" class="text-button" type="button" :disabled="processing" @click="useOriginalPhoto">원본 배경 사용</button>
             </div>
             <p class="hint">{{ shareHint || '공유 메뉴에서 앱이 보이지 않으면 사진을 저장한 뒤 보관함에서 선택해 주세요.' }}</p>
+            <p v-if="!editId && !photo" class="hint">보관함에서 여러 장을 선택하면 한 번에 등록할 수 있어요.</p>
+            <p class="hint">카메라나 사진 보관함이 열리지 않으면 기기의 접근 권한을 확인하거나 다른 사진 입력 방법을 사용해 주세요.</p>
+            <p v-if="processing" class="hint" role="status">사진을 처리하고 있어요…</p>
+            <p v-if="photoError" class="error" role="alert">{{ photoError }}</p>
+            <p v-for="note in photoNotes" :key="note" class="hint">{{ note }}</p>
             <div v-if="cropping" class="crop-controls">
               <label>확대 <input v-model.number="crop.zoom" type="range" min="1" max="3" step=".05" @input="adjustCrop"></label>
               <label>가로 위치 <input v-model.number="crop.x" type="range" min="0" max="100" @input="adjustCrop"></label>
@@ -454,15 +588,7 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
               <label v-for="tag in tags" :key="tag" class="chip tag"><input v-model="selectedTags" type="checkbox" :value="tag">{{ tag }}</label>
             </div>
           </fieldset>
-          <fieldset :disabled="busy"><legend>아바타 착용 이미지 <span>선택</span></legend>
-            <p class="hint">배경을 투명하게 만든 PNG를 추가하면 아바타에서 입혀볼 수 있어요.</p>
-            <BlobPhoto v-if="wear" class="wear-preview" :blob="wear" alt="착용 이미지 미리보기" />
-            <div class="actions uploads">
-              <label class="button outline small"><Upload :size="17" /> PNG 선택<input class="file-input" aria-label="착용용 PNG 선택" type="file" accept="image/png" @change="changeWear"></label>
-              <button v-if="wear" type="button" class="text-button" :disabled="checkingWear" @click="wear = undefined">착용 이미지 제거</button>
-            </div>
-          </fieldset>
-          <div class="actions"><button class="button" :disabled="busy || processing || checkingWear" type="submit">옷 저장하기</button>
+          <div class="actions"><button class="button" :disabled="busy || processing" type="submit">옷 저장하기</button>
             <button v-if="editId" class="button outline danger" type="button" :disabled="busy" @click="deleteItem">삭제</button>
           </div>
         </form>
@@ -483,7 +609,6 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
             <button class="button outline" :disabled="busy" @click="saveLook(suggested)"><Bookmark :size="17" /> 저장하기</button>
             <button class="button outline" @click="startManual(suggested)">직접 수정하기</button>
             <button class="button outline" @click="openPreview(suggested)">미리보기</button>
-            <button class="button outline" @click="openPreview(suggested, true)">아바타로 보기</button>
           </div>
         </div>
         <div v-else class="empty">
@@ -507,40 +632,32 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
           {{ missingCategories.map(kind => labels[kind]).join(', ') }}을(를) 옷장에 추가해 주세요.
           <button class="text-button" @click="openItem(undefined, missingCategories[0])">옷 추가 <ArrowRight :size="16" /></button>
         </div>
-        <div class="panel">
-          <LookCard :items="items" :look="manual" editable @replace="activeCategory = $event" />
-          <div class="chips">
-            <button v-for="kind in categories" :key="kind" class="chip" :aria-pressed="activeCategory === kind" @click="activeCategory = kind">{{ labels[kind] }}</button>
-          </div>
-          <div v-if="manualOptions.length" class="wardrobe-grid options">
-            <button v-for="item in manualOptions" :key="item.id" class="piece" :aria-pressed="selection[activeCategory] === item.id" @click="selection[activeCategory] = item.id">
-              <BlobPhoto :blob="item.photo" :alt="item.name || labels[item.category]" /><strong>{{ item.name || labels[item.category] }}</strong>
-            </button>
-          </div>
-          <button v-else class="button outline small" @click="openItem(undefined, activeCategory)">{{ labels[activeCategory] }} 추가</button>
+        <div class="outfit-stage">
+          <section v-for="row in manualRows" :id="'manual-' + row.kind" :key="row.kind" class="outfit-row" :aria-label="labels[row.kind]">
+            <button class="button outline small" :disabled="row.options.length < 2"
+              :aria-label="labels[row.kind] + ' 이전'" @click="changeManualItem(row, -1)">이전</button>
+            <div class="outfit-slot" :class="row.kind" aria-live="polite">
+              <BlobPhoto v-if="row.item" :blob="outfitPhoto(row.item)" :alt="row.item.name || labels[row.kind]" />
+              <button v-else class="button outline small" @click="openItem(undefined, row.kind)">{{ labels[row.kind] }} 추가</button>
+              <small v-if="row.item">{{ row.item.name || labels[row.kind] }} · {{ row.index + 1 }} / {{ row.options.length }}</small>
+            </div>
+            <button class="button outline small" :disabled="row.options.length < 2"
+              :aria-label="labels[row.kind] + ' 다음'" @click="changeManualItem(row, 1)">다음</button>
+          </section>
           <div class="actions">
             <button class="button" :disabled="!complete" @click="openPreview(manual)">코디 미리보기 <ArrowRight :size="17" /></button>
-            <button class="button outline" :disabled="!complete || busy" @click="saveLook(manual)">저장하기</button>
-            <button class="button outline" :disabled="!complete" @click="openPreview(manual, true)">아바타로 보기</button>
+            <button class="button" :disabled="!complete || busy" @click="saveLook(manual)"><Bookmark :size="17" /> 코디 저장</button>
           </div>
         </div>
       </section>
 
       <section v-else-if="screen === 'preview' && preview" class="narrow">
         <h1>코디 미리보기</h1>
-        <div class="panel">
+        <div :class="savedPreview || preview.mode === 'manual' ? 'outfit-stage' : 'panel'">
           <p v-if="preview.situation" class="hint">{{ preview.situation }}</p>
-          <div class="chips">
-            <button class="chip" :aria-pressed="!wearing" @click="wearing = false">코디 카드</button>
-            <button class="chip" :aria-pressed="wearing" @click="toggleAvatar">아바타로 보기</button>
-          </div>
-          <template v-if="wearing && savedShape">
-            <AvatarFigure :shape="savedShape" :pieces="pieces" />
-            <p class="hint">아바타는 코디 참고용이에요. 실제 착용 핏은 달라질 수 있어요.</p>
-            <p v-if="missingWear.length" class="hint">{{ missingWear.join(', ') }}의 착용 이미지가 없어요. 옷을 수정해 투명 배경 PNG를 추가할 수 있어요.</p>
-            <button class="text-button" @click="openAvatar('preview')">아바타 수정 <ChevronRight :size="17" /></button>
-          </template>
-          <LookCard :items="items" :look="preview" editable @replace="startManual(preview, $event)" />
+          <p v-if="savedPreview" class="hint">저장한 날짜 · {{ lookDate(savedPreview.saved) }}</p>
+          <LookCard :items="items" :look="preview" :vertical="Boolean(savedPreview) || preview.mode === 'manual'"
+            :photo-first="Boolean(savedPreview)" editable @replace="startManual(preview, $event)" />
           <div class="actions">
             <button v-if="!savedPreview" class="button" :disabled="busy" @click="saveLook(preview)"><Bookmark :size="17" /> 코디 저장</button>
             <button v-else class="button outline danger" :disabled="busy" @click="deleteLook(savedPreview.id)">저장 코디 삭제</button>
@@ -548,35 +665,29 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
         </div>
       </section>
 
-      <section v-else-if="screen === 'saved'">
-        <div class="page-heading"><h1>저장 코디</h1><p>다시 입고 싶은 조합을 모아보세요.</p></div>
+      <section v-else-if="screen === 'saved'" class="narrow">
+        <div class="page-heading"><h1>저장 코디</h1></div>
+        <div v-if="saved.length" class="chips saved-filters" role="group" aria-label="저장 코디 상황 필터">
+          <button class="chip" :aria-pressed="savedFilter === 'all'" @click="savedFilter = 'all'">전체</button>
+          <button v-for="tag in tags" :key="tag" class="chip" :aria-pressed="savedFilter === tag" @click="savedFilter = tag">{{ tag }}</button>
+          <button class="chip" :aria-pressed="savedFilter === ''" @click="savedFilter = ''">상황 미지정</button>
+        </div>
         <div v-if="!saved.length" class="empty">
           <Heart :size="32" /><h2>아직 저장한 코디가 없어요</h2>
           <div class="actions"><button class="button" @click="startRecommendations">코디 추천받기</button>
             <button class="button outline" @click="startManual()">직접 코디하기</button></div>
         </div>
-        <div v-else class="saved-grid">
-          <article v-for="look in saved" :key="look.id" class="panel">
-            <h2>{{ look.situation || '나의 코디' }}</h2><p class="hint">{{ lookDate(look.saved) }}</p>
-            <LookCard :items="items" :look="look" />
-            <button class="text-button extra" @click="openPreview(look)">코디 열기 <ArrowRight :size="16" /></button>
+        <p v-else-if="!visibleSaved.length" class="hint" role="status">이 상황에 저장한 코디가 없어요.</p>
+        <div v-else class="saved-list">
+          <article v-for="look in visibleSaved" :key="look.id" class="saved-entry">
+            <h2><button class="saved-entry-open" @click="openPreview(look)">{{ look.situation || '나의 코디' }}
+              <ChevronRight :size="18" aria-hidden="true" />
+            </button></h2>
+            <LookCard :items="items" :look="look" vertical photo-first />
           </article>
         </div>
       </section>
 
-      <section v-else-if="screen === 'avatar'" class="narrow">
-        <h1>아바타 설정</h1>
-        <p>키와 몸무게로 코디 참고용 아바타를 만들어요.</p>
-        <form class="form-stack panel" novalidate @submit.prevent="saveAvatar">
-          <div class="two-fields">
-            <label class="field">키 (cm) <input v-model="height" type="number" inputmode="decimal" step="any" placeholder="170" required></label>
-            <label class="field">몸무게 (kg) <input v-model="weight" type="number" inputmode="decimal" step="any" placeholder="60" required></label>
-          </div>
-          <AvatarFigure :shape="draftShape || { height: 1, width: 1 }" />
-          <p class="hint">아바타는 코디 참고용이에요. 실제 착용 핏은 달라질 수 있어요. 입력한 값은 이 브라우저에만 저장돼요.</p>
-          <button class="button" type="submit" :disabled="busy">아바타 저장 <ArrowDown :size="17" /></button>
-        </form>
-      </section>
     </template>
   </main>
 
