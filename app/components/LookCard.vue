@@ -10,7 +10,7 @@ const pieces = computed(() => resolveItems(props.items, props.look.ids))
 <template>
   <div class="look-grid" :class="{ 'look-vertical': vertical, 'look-photo-first': photoFirst }">
     <component :is="editable ? 'button' : 'div'" v-for="{ category, item } in pieces" :key="category"
-      class="piece" :type="editable ? 'button' : undefined" @click="editable && $emit('replace', category)">
+      class="piece" :class="'piece-' + category" :type="editable ? 'button' : undefined" @click="editable && $emit('replace', category)">
       <BlobPhoto v-if="item" :blob="outfitPhoto(item)" :alt="item.name || labels[category]" />
       <div v-else class="placeholder"><Shirt :size="22" /></div>
       <template v-if="!photoFirst || !item">

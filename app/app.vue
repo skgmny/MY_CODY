@@ -66,6 +66,8 @@ const session = shallowRef<ReturnType<typeof recommendation<Item>>>()
 const emptySelection = (): Selection => ({ top: '', bottom: '', shoes: '' })
 const selection = ref(emptySelection())
 const manualPool = shallowRef<ReadonlySet<string>>()
+const pickerKind = ref<Category>()
+const outfitPicker = ref<HTMLDialogElement>()
 const preview = shallowRef<Look | SavedLook>()
 const previewPool = shallowRef<ReadonlySet<string>>()
 
@@ -79,6 +81,7 @@ const manualRows = computed(() => categories.map(kind => {
   const index = Math.max(0, options.findIndex(item => item.id === selection.value[kind]))
   return { kind, options, index, item: options[index] }
 }))
+const pickerRow = computed(() => manualRows.value.find(row => row.kind === pickerKind.value))
 const manual = computed<Look>(() => {
   const ids = emptySelection()
   for (const row of manualRows.value) ids[row.kind] = row.item?.id ?? ''
@@ -563,6 +566,17 @@ function changeManualItem(row: typeof manualRows.value[number], direction: -1 | 
   if (item) selection.value[row.kind] = item.id
 }
 
+async function openOutfitPicker(kind: Category) {
+  pickerKind.value = kind
+  await nextTick()
+  if (screen.value === 'manual' && outfitPicker.value && !outfitPicker.value.open) outfitPicker.value.showModal()
+}
+
+function pickManualItem(item: Item) {
+  selection.value[item.category] = item.id
+  outfitPicker.value?.close()
+}
+
 function openPreview(look: Look | SavedLook) {
   preview.value = look
   previewPool.value = screen.value === 'manual' ? manualPool.value : undefined
@@ -838,7 +852,10 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
             <button class="button outline small" :disabled="row.options.length < 2"
               :aria-label="labels[row.kind] + ' 이전'" @click="changeManualItem(row, -1)">이전</button>
             <div class="outfit-slot" :class="row.kind" aria-live="polite">
-              <BlobPhoto v-if="row.item" :blob="outfitPhoto(row.item)" :alt="row.item.name || labels[row.kind]" />
+              <button v-if="row.item" type="button" class="outfit-photo-button" aria-haspopup="dialog"
+                :aria-label="labels[row.kind] + ' 사진에서 고르기'" @click="openOutfitPicker(row.kind)">
+                <BlobPhoto :blob="outfitPhoto(row.item)" :alt="row.item.name || labels[row.kind]" />
+              </button>
               <small v-else-if="manualPool">선택한 {{ labels[row.kind] }} 없음</small>
               <button v-else class="button outline small" @click="openItem(undefined, row.kind)">{{ labels[row.kind] }} 추가</button>
               <small v-if="row.item">{{ row.item.name || labels[row.kind] }} · {{ row.index + 1 }} / {{ row.options.length }}</small>
@@ -851,6 +868,23 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
             <button class="button" :disabled="!complete || busy" @click="saveLook(manual)"><Bookmark :size="17" /> 코디 저장</button>
           </div>
         </div>
+        <dialog ref="outfitPicker" class="outfit-picker" aria-labelledby="outfit-picker-title"
+          @click.self="outfitPicker?.close()" @close="pickerKind = undefined">
+          <div v-if="pickerRow">
+            <div class="section-heading">
+              <h2 id="outfit-picker-title">{{ labels[pickerRow.kind] }} 고르기</h2>
+              <button type="button" class="button outline small" autofocus @click="outfitPicker?.close()">닫기</button>
+            </div>
+            <div class="outfit-picker-items">
+              <button v-for="(item, i) in pickerRow.options" :key="item.id" type="button" class="piece outfit-thumbnail"
+                :aria-label="(item.name || labels[pickerRow.kind]) + ' ' + (i + 1)"
+                :aria-pressed="pickerRow.item?.id === item.id" @click="pickManualItem(item)">
+                <BlobPhoto :blob="outfitPhoto(item)" alt="" />
+                <span>{{ item.name || labels[pickerRow.kind] }}</span>
+              </button>
+            </div>
+          </div>
+        </dialog>
       </section>
 
       <section v-else-if="screen === 'preview' && preview" class="narrow">
