@@ -3,7 +3,9 @@ import { ArrowLeft, ArrowRight, Bookmark, Camera, Check, ChevronRight, Heart, Ho
   Layers3, Plus, Shirt, Sparkles } from 'lucide-vue-next'
 import { categories, labels, orderedItems, outfitPhoto, recommendation, resolveItems, tags,
   type Category, type Item, type Look, type SavedLook, type Selection, type Tag } from '~/utils/outfits'
-import { read, readAll, remove, removeSelected, write, writeItems } from '~/utils/storage'
+import { clearLookDetails, pendingLookDetails, persistLookDetails, read, readAll, remove, removeSelected, write, writeItems,
+  type LookDetailsPatch } from '~/utils/storage'
+import { initializeStarterClothes, isStarterItem } from '~/utils/starter-clothes'
 import { cropPhoto, decodeImage, defaultCrop, fitsPhotoUpload, fullPhotoBounds, photoCropRect, photoUploadLimit,
   selectedPhotoBounds, type PhotoBounds } from '~/utils/images'
 
@@ -27,6 +29,7 @@ const ready = ref(false)
 const loadError = ref('')
 const error = ref('')
 const notice = ref('')
+let noticeTimer: ReturnType<typeof setTimeout> | undefined
 const busy = ref(false)
 const filter = ref<Category | 'all'>('all')
 const listSelection = ref<string[] | null>(null)
@@ -74,6 +77,8 @@ const preview = shallowRef<Look | SavedLook>()
 const previewPool = shallowRef<ReadonlySet<string>>()
 const lookDetails = ref<{ title: string; situation: Tag | ''; memo: string }>()
 const memoExpanded = ref(false)
+const memoEditor = ref<HTMLTextAreaElement>()
+const memoTrigger = ref<HTMLButtonElement>()
 
 const recent = computed(() => saved.value.slice(0, 2))
 const wardrobe = computed(() => items.value.filter(item => filter.value === 'all' || item.category === filter.value))
@@ -131,9 +136,17 @@ function back() {
 async function initialize() {
   loadError.value = ''
   try {
+    await initializeStarterClothes().catch(() => {
+      showNotice('예시 옷을 불러오지 못했어요. 옷을 직접 추가할 수 있어요.')
+    })
     const [clothes, looks] = await Promise.all([readAll('items'), readAll('looks')])
     items.value = clothes.sort((a, b) => b.created - a.created)
-    saved.value = looks.sort((a, b) => b.saved - a.saved)
+    saved.value = looks.map(look => {
+      const pending = pendingLookDetails(look.id)
+      if (!pending) return look
+      void persistLookDetails(look.id).catch(reportLookSaveError)
+      return { ...look, ...pending }
+    }).sort((a, b) => b.saved - a.saved)
     ready.value = true
   } catch {
     loadError.value = '이 브라우저에서 옷장 데이터를 열 수 없어요. 저장 공간 설정을 확인해 주세요.'
@@ -162,10 +175,24 @@ onMounted(() => {
   void initialize()
   if ('serviceWorker' in navigator && !import.meta.dev) {
     navigator.serviceWorker.register('/sw.js').catch(() => {
-      notice.value = '이 브라우저에서 앱 설치 및 공유 수신을 설정할 수 없어요. 사진은 직접 등록할 수 있어요.'
+      showNotice('이 브라우저에서 앱 설치 및 공유 수신을 설정할 수 없어요. 사진은 직접 등록할 수 있어요.')
     })
   }
 })
+
+function dismissNotice() {
+  clearTimeout(noticeTimer)
+  noticeTimer = undefined
+  notice.value = ''
+}
+
+function showNotice(message: string) {
+  clearTimeout(noticeTimer)
+  notice.value = message
+  noticeTimer = setTimeout(dismissNotice, 10_000)
+}
+
+onBeforeUnmount(dismissNotice)
 
 function openItem(item?: Item, kind?: Category) {
   analysis.value?.abort()
@@ -463,7 +490,7 @@ async function commit(action: () => Promise<void>, success: string, next?: () =>
   error.value = ''
   try {
     await action()
-    notice.value = success
+    showNotice(success)
   } catch {
     error.value = '변경사항을 저장하지 못했어요. 기기의 저장 공간을 확인하고 다시 시도해 주세요.'
     return
@@ -578,7 +605,10 @@ async function deleteSelection(kind: 'items' | 'looks') {
   await commit(async () => {
     await removeSelected(kind, selected)
     if (clothes) items.value = items.value.filter(item => !ids.has(item.id))
-    else saved.value = saved.value.filter(look => !ids.has(look.id))
+    else {
+      selected.forEach(clearLookDetails)
+      saved.value = saved.value.filter(look => !ids.has(look.id))
+    }
     listSelection.value = null
   }, `${count}${clothes ? '을' : '를'} 삭제했어요.`)
 }
@@ -636,28 +666,43 @@ function pickManualItem(item: Item) {
 
 function openPreview(look: Look | SavedLook) {
   preview.value = look
-  lookDetails.value = undefined
-  memoExpanded.value = false
+  resetLookDetails(savedPreview.value)
   previewPool.value = screen.value === 'manual' ? manualPool.value : undefined
   show('preview')
 }
 
-function editLookDetails(look: SavedLook) {
-  lookDetails.value = { title: look.title ?? '', situation: look.situation, memo: look.memo ?? '' }
+function resetLookDetails(look?: SavedLook) {
+  lookDetails.value = look && { title: look.title ?? '', situation: look.situation, memo: look.memo ?? '' }
+  memoExpanded.value = false
 }
 
-async function saveLookDetails() {
+async function toggleMemo() {
+  memoExpanded.value = !memoExpanded.value
+  await nextTick()
+  if (memoExpanded.value) memoEditor.value?.focus()
+  else memoTrigger.value?.focus()
+}
+
+function reportLookSaveError() {
+  error.value = '코디 정보 저장을 완료하지 못했어요. 브라우저 저장 공간을 확인해 주세요.'
+}
+
+function saveLookDetails(change: LookDetailsPatch) {
   const look = savedPreview.value
-  const details = lookDetails.value
-  if (!look || !details) return
-  const entry: SavedLook = { ...look, title: details.title.trim(), situation: details.situation, memo: details.memo.trim() }
-  await commit(async () => {
-    await write('looks', entry.id, entry)
-    saved.value = saved.value.map(current => current.id === entry.id ? entry : current)
-    preview.value = entry
-    memoExpanded.value = false
-    lookDetails.value = undefined
-  }, '코디 정보를 저장했어요.')
+  if (!look) return
+  const entry: SavedLook = { ...look, ...change }
+  saved.value = saved.value.map(current => current.id === look.id ? entry : current)
+  preview.value = entry
+  void persistLookDetails(look.id, change).catch(reportLookSaveError)
+}
+
+function saveLookText(field: 'title' | 'memo', event: Event) {
+  const input = event.target as HTMLInputElement | HTMLTextAreaElement
+  saveLookDetails({ [field]: field === 'title' ? input.value.trim() : input.value })
+}
+
+function saveLookSituation(event: Event) {
+  saveLookDetails({ situation: (event.target as HTMLSelectElement).value as Tag | '' })
 }
 
 async function saveLook(look: Look) {
@@ -669,7 +714,10 @@ async function saveLook(look: Look) {
   await commit(async () => {
     await write('looks', entry.id, entry)
     saved.value = [entry, ...saved.value]
-    if (screen.value === 'preview') preview.value = entry
+    if (screen.value === 'preview') {
+      preview.value = entry
+      resetLookDetails(entry)
+    }
   }, '코디를 저장했어요.')
 }
 
@@ -677,6 +725,7 @@ async function deleteLook(id: string) {
   if (!window.confirm('저장 코디를 삭제할까요?')) return
   await commit(async () => {
     await remove('looks', id)
+    clearLookDetails(id)
     saved.value = saved.value.filter(look => look.id !== id)
   }, '저장 코디를 삭제했어요.', () => show('saved', true))
 }
@@ -701,7 +750,7 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
     <p v-else-if="!ready" role="status">옷장을 여는 중이에요…</p>
     <template v-else>
       <p v-if="notice" class="notification" role="status">
-        {{ notice }} <button aria-label="알림 닫기" @click="notice = ''">×</button>
+        {{ notice }} <button aria-label="알림 닫기" @click="dismissNotice">×</button>
       </p>
       <button v-if="trail.length" type="button" class="back" @click="back"><ArrowLeft :size="17" /> 뒤로</button>
       <p v-if="error" class="error" role="alert">{{ error }}</p>
@@ -729,7 +778,8 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
             <div class="closet-summary">
               <div class="feature-icon rosy"><Shirt :size="24" /></div>
               <div><strong>{{ items.length ? '등록한 옷 ' + items.length + '벌' : '첫 옷을 등록해 보세요' }}</strong>
-                <p>{{ items.length ? '내 옷으로 오늘 입을 코디를 만들어 보세요.' : '상의, 하의, 신발을 한 벌씩 담아보세요.' }}</p>
+                <p v-if="items.some(isStarterItem)">예시 옷으로 코디를 만들어 보세요.</p>
+                <p v-else>{{ items.length ? '내 옷으로 오늘 입을 코디를 만들어 보세요.' : '상의, 하의, 신발을 한 벌씩 담아보세요.' }}</p>
               </div>
               <button class="button outline small" @click="openItem()"><Plus :size="17" /> 옷 추가</button>
             </div>
@@ -782,7 +832,7 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
               <Check v-if="listSelection.includes(item.id)" :size="16" />
             </span>
             <BlobPhoto :blob="outfitPhoto(item)" :alt="item.name || labels[item.category]" />
-            <span>{{ labels[item.category] }}</span><strong>{{ item.name || labels[item.category] }}</strong>
+            <span>{{ labels[item.category] }}{{ isStarterItem(item) ? ' · 예시' : '' }}</span><strong>{{ item.name || labels[item.category] }}</strong>
           </button>
         </div>
       </section>
@@ -969,37 +1019,35 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
       </section>
 
       <section v-else-if="screen === 'preview' && preview" class="narrow">
-        <div v-if="savedPreview" class="section-heading saved-detail-heading">
-          <h1>{{ lookTitle(savedPreview) }}</h1>
-          <button v-if="!lookDetails" class="button outline small" type="button" :disabled="busy"
-            @click="editLookDetails(savedPreview)">코디 정보 수정</button>
-        </div>
-        <h1 v-else>코디 미리보기</h1>
-        <form v-if="savedPreview && lookDetails" class="form-stack saved-detail-form" @submit.prevent="saveLookDetails">
-          <label class="field">제목 <input v-model="lookDetails.title" :placeholder="lookTitle(savedPreview)" :disabled="busy"></label>
-          <label class="field">상황
-            <select v-model="lookDetails.situation" :disabled="busy">
-              <option value="">상황 미지정</option>
-              <option v-for="tag in tags" :key="tag" :value="tag">{{ tag }}</option>
-            </select>
-          </label>
-          <label class="field">메모 <textarea v-model="lookDetails.memo" rows="4" :disabled="busy" /></label>
-          <div class="actions">
-            <button class="button small" type="submit" :disabled="busy">변경사항 저장</button>
-            <button class="button outline small" type="button" :disabled="busy" @click="lookDetails = undefined; error = ''">취소</button>
-          </div>
-        </form>
+        <h1 v-if="!savedPreview">코디 미리보기</h1>
         <div :class="savedPreview || preview.mode === 'manual' ? 'outfit-stage' : 'panel'">
-          <p v-if="savedPreview" class="hint">상황 · {{ savedPreview.situation || '미지정' }}</p>
+          <div v-if="savedPreview && lookDetails" class="saved-detail-fields">
+            <label class="field">제목
+              <input v-model="lookDetails.title" class="saved-title-input" :placeholder="lookDetails.situation || '나의 코디'"
+                :disabled="busy" @input="saveLookText('title', $event)">
+            </label>
+            <label class="field situation-field">상황
+              <select v-model="lookDetails.situation" :disabled="busy" @change="saveLookSituation">
+                <option value="">상황 미지정</option>
+                <option v-for="tag in tags" :key="tag" :value="tag">{{ tag }}</option>
+              </select>
+            </label>
+            <p class="hint">변경사항은 자동으로 저장돼요.</p>
+          </div>
           <p v-else-if="preview.situation" class="hint">{{ preview.situation }}</p>
           <p v-if="savedPreview" class="hint">저장한 날짜 · {{ lookDate(savedPreview.saved) }}</p>
           <LookCard :items="items" :look="preview" :vertical="Boolean(savedPreview) || preview.mode === 'manual'"
             :photo-first="Boolean(savedPreview)" editable @replace="startManual(preview, $event, previewPool)" />
-          <section v-if="savedPreview?.memo && !lookDetails" class="saved-memo" aria-labelledby="saved-memo-title">
+          <section v-if="lookDetails" class="saved-memo" aria-labelledby="saved-memo-title">
             <h2 id="saved-memo-title">메모</h2>
-            <button class="saved-memo-toggle" type="button" :aria-expanded="memoExpanded" @click="memoExpanded = !memoExpanded">
-              <span class="saved-memo-text" :class="{ 'memo-collapsed': !memoExpanded }">{{ savedPreview.memo }}</span>
-              <span class="memo-action">{{ memoExpanded ? '접기' : '펼치기' }}</span>
+            <div v-if="memoExpanded" class="field">
+              <textarea ref="memoEditor" v-model="lookDetails.memo" class="saved-memo-editor" rows="4"
+                aria-label="메모" :disabled="busy" @input="saveLookText('memo', $event)" />
+              <button class="text-button" type="button" @click="toggleMemo">메모 접기</button>
+            </div>
+            <button v-else ref="memoTrigger" class="saved-memo-toggle" type="button" aria-expanded="false" @click="toggleMemo">
+              <span v-if="lookDetails.memo" class="saved-memo-text">{{ lookDetails.memo }}</span>
+              <span class="memo-action">{{ lookDetails.memo ? '메모 펼쳐 수정하기' : '메모 쓰기' }}</span>
             </button>
           </section>
           <div class="actions">
