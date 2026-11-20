@@ -74,5 +74,10 @@ export const writeItems = (items: Item[]) =>
     for (const item of items) store.put(item, item.id)
     return store.count()
   })
+export const removeSelected = (name: 'items' | 'looks', ids: string[]) =>
+  transact(name, 'readwrite', store => {
+    for (const id of ids) store.delete(id)
+    return store.count()
+  })
 export const remove = <K extends keyof Stores>(name: K, key: string) =>
   transact(name, 'readwrite', store => store.delete(key))

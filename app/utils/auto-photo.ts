@@ -5,7 +5,8 @@ import wasmBinary from '../../node_modules/onnxruntime-web/dist/ort-wasm-simd-th
 import { decodeImage } from './images'
 import { photoLabels, photoSuggestions } from './photo-suggestions'
 
-const modelUrl = 'https://huggingface.co/edgetools/u2netp/resolve/25dee37/u2netp.onnx'
+// U²-Netp by Xuebin Qin et al., Apache-2.0. ONNX weights distributed by rembg.
+const modelUrl = '/models/u2netp.onnx'
 const size = 320
 let classifier: Promise<ZeroShotImageClassificationPipeline> | undefined
 let segmenter: Promise<InferenceSession> | undefined
@@ -31,7 +32,11 @@ async function removeBackground(image: HTMLImageElement) {
   const context = canvas.getContext('2d', { willReadFrequently: true })!
   context.drawImage(image, 0, 0, canvas.width, canvas.height)
   const pixels = context.getImageData(0, 0, canvas.width, canvas.height)
-  if (pixels.data.some((value, index) => index % 4 === 3 && value < 250)) return undefined
+  let transparent = 0
+  for (let i = 3; i < pixels.data.length; i += 4) {
+    if (pixels.data[i]! < 32) transparent++
+  }
+  if (transparent / (canvas.width * canvas.height) > 0.05) return undefined
 
   const sample = document.createElement('canvas')
   sample.width = sample.height = size
@@ -102,25 +107,26 @@ async function removeBackground(image: HTMLImageElement) {
   ))
 }
 
-export async function analyzePhoto(file: Blob, signal: AbortSignal) {
-  const image = await decodeImage(file)
-  const notes: string[] = []
-  let cutout: Blob | undefined
+export async function analyzeBackground(file: Blob) {
   try {
-    cutout = await removeBackground(image)
+    const cutout = await removeBackground(await decodeImage(file))
+    return { cutout, note: cutout ? '배경을 제거했어요.' : '이미 배경이 투명한 사진이에요.' }
   } catch (error) {
     if (import.meta.dev) console.warn('Background model:', error)
-    notes.push('배경을 자동으로 잘라내지 못해 원본 사진을 사용했어요.')
+    return { cutout: undefined, note: '배경을 제거하지 못해 자른 사진을 표시했어요.' }
   }
-  signal.throwIfAborted()
+}
+
+export async function analyzePhotoTags(file: Blob) {
+  const notes: string[] = []
   try {
-    const suggestion = await classify(cutout ?? file)
+    const suggestion = await classify(file)
     if (!suggestion.category) notes.push('품목을 확실히 구분하지 못했어요. 종류를 직접 골라 주세요.')
     else if (!suggestion.tags.length) notes.push('사진만으로 상황을 구분하기 어려워 태그를 비워뒀어요.')
-    return { cutout, ...suggestion, notes }
+    return { ...suggestion, notes }
   } catch (error) {
     if (import.meta.dev) console.warn('Clothing classifier:', error)
     notes.push('종류와 상황 태그를 자동으로 고르지 못했어요.')
-    return { cutout, category: '' as const, tags: [], notes }
+    return { category: '' as const, tags: [], notes }
   }
 }

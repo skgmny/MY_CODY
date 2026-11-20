@@ -1,12 +1,35 @@
 export type Crop = { zoom: number; x: number; y: number }
+export type PhotoBounds = { left: number; top: number; right: number; bottom: number }
+export const photoUploadLimit = 10
+export const fullPhotoBounds = (): PhotoBounds => ({ left: 0, top: 0, right: 100, bottom: 100 })
+export type CropHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw'
+
+export function resizePhotoBounds(bounds: PhotoBounds, handle: CropHandle, dx: number, dy: number): PhotoBounds {
+  const next = { ...bounds }
+  if (handle.includes('w')) next.left = Math.max(0, Math.min(bounds.right - 5, bounds.left + dx))
+  if (handle.includes('e')) next.right = Math.min(100, Math.max(bounds.left + 5, bounds.right + dx))
+  if (handle.includes('n')) next.top = Math.max(0, Math.min(bounds.bottom - 5, bounds.top + dy))
+  if (handle.includes('s')) next.bottom = Math.min(100, Math.max(bounds.top + 5, bounds.bottom + dy))
+  return next
+}
+
+export function fitsPhotoUpload(existing: number, added: number, limit = photoUploadLimit) {
+  return added > 0 && existing + added <= limit
+}
+
+export function selectedPhotoBounds(bounds: PhotoBounds) {
+  return bounds.left || bounds.top || bounds.right !== 100 || bounds.bottom !== 100 ? { ...bounds } : undefined
+}
 export const defaultCrop = (): Crop => ({ zoom: 1, x: 50, y: 50 })
 
-export function photoCropRect(width: number, height: number, crop: Crop) {
-  const croppedWidth = width / crop.zoom
-  const croppedHeight = height / crop.zoom
+export function photoCropRect(width: number, height: number, crop: Crop, bounds = fullPhotoBounds()) {
+  const regionWidth = width * (bounds.right - bounds.left) / 100
+  const regionHeight = height * (bounds.bottom - bounds.top) / 100
+  const croppedWidth = regionWidth / crop.zoom
+  const croppedHeight = regionHeight / crop.zoom
   return {
-    x: (width - croppedWidth) * crop.x / 100,
-    y: (height - croppedHeight) * crop.y / 100,
+    x: width * bounds.left / 100 + (regionWidth - croppedWidth) * crop.x / 100,
+    y: height * bounds.top / 100 + (regionHeight - croppedHeight) * crop.y / 100,
     width: croppedWidth,
     height: croppedHeight,
   }
@@ -27,9 +50,9 @@ export async function decodeImage(file: Blob) {
   }
 }
 
-export async function cropPhoto(file: Blob, crop: Crop) {
+export async function cropPhoto(file: Blob, crop: Crop, bounds?: PhotoBounds) {
   const image = await decodeImage(file)
-  const rect = photoCropRect(image.naturalWidth, image.naturalHeight, crop)
+  const rect = photoCropRect(image.naturalWidth, image.naturalHeight, crop, bounds)
   const scale = Math.min(1, 960 / Math.max(rect.width, rect.height))
   const canvas = document.createElement('canvas')
   canvas.width = Math.max(1, Math.round(rect.width * scale))

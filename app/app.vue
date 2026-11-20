@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ArrowLeft, ArrowRight, Bookmark, Camera, ChevronRight, Heart, House, ImagePlus,
+import { ArrowLeft, ArrowRight, Bookmark, Camera, Check, ChevronRight, Heart, House, ImagePlus,
   Layers3, Plus, Shirt, Sparkles } from 'lucide-vue-next'
 import { categories, labels, orderedItems, outfitPhoto, recommendation, resolveItems, tags,
   type Category, type Item, type Look, type SavedLook, type Selection, type Tag } from '~/utils/outfits'
-import { read, readAll, remove, write, writeItems } from '~/utils/storage'
-import { cropPhoto, defaultCrop } from '~/utils/images'
+import { read, readAll, remove, removeSelected, write, writeItems } from '~/utils/storage'
+import { cropPhoto, decodeImage, defaultCrop, fitsPhotoUpload, fullPhotoBounds, photoCropRect, photoUploadLimit,
+  selectedPhotoBounds, type PhotoBounds } from '~/utils/images'
 
 type Screen = 'home' | 'wardrobe' | 'item' | 'recommend' | 'manual' | 'preview' | 'saved'
 const nav = [{ id: 'home', label: '홈', icon: House }, { id: 'wardrobe', label: '내 옷장', icon: Shirt },
@@ -28,23 +29,33 @@ const error = ref('')
 const notice = ref('')
 const busy = ref(false)
 const filter = ref<Category | 'all'>('all')
+const listSelection = ref<string[] | null>(null)
+let listPress: { timer: ReturnType<typeof setTimeout>; x: number; y: number; pointerId: number } | undefined
+let longPressedItem = ''
 const editId = ref('')
 const category = ref<Category | ''>('')
 const name = ref('')
 const selectedTags = ref<Tag[]>([])
 const original = shallowRef<Blob>()
 const cutout = shallowRef<Blob>()
+const useCutout = ref(false)
 const photo = shallowRef<Blob>()
-const crop = ref(defaultCrop())
+const sourceBounds = shallowRef<PhotoBounds>()
 const appliedCrop = shallowRef(defaultCrop())
-const cropping = ref(false)
 const processing = ref(false)
 const replacingPhoto = ref(false)
 const photoError = ref('')
 const photoNotes = ref<string[]>([])
 const analysis = shallowRef<AbortController>()
-type BatchPhoto = { file: File; photo?: Blob; originalPreview?: Blob; cutout?: Blob; category: Category | ''; tags: Tag[]; notes?: string[]; error?: string }
+const analyzingTags = ref(false)
+type PhotoDraft = { id: number; file: Blob; label: string; bounds: PhotoBounds; recrop?: boolean; error?: string }
+type BatchPhoto = PhotoDraft & { photo?: Blob; originalPreview?: Blob; cutout?: Blob; useCutout?: boolean; category: Category | ''; tags: Tag[]; notes?: string[] }
+const photoDrafts = ref<PhotoDraft[]>([])
+const activePhoto = ref(0)
+const activeDraft = computed(() => photoDrafts.value.find(draft => draft.id === activePhoto.value))
 const batch = ref<BatchPhoto[]>([])
+const uploadLimit = computed(() => editId.value || (!batch.value.length && photo.value) ? 1 : photoUploadLimit)
+let draftId = 0
 let photoVersion = 0
 const shareHint = ref('')
 const recommendedSituation = ref<Tag | ''>('')
@@ -54,7 +65,9 @@ const started = ref(false)
 const session = shallowRef<ReturnType<typeof recommendation<Item>>>()
 const emptySelection = (): Selection => ({ top: '', bottom: '', shoes: '' })
 const selection = ref(emptySelection())
+const manualPool = shallowRef<ReadonlySet<string>>()
 const preview = shallowRef<Look | SavedLook>()
+const previewPool = shallowRef<ReadonlySet<string>>()
 
 const recent = computed(() => saved.value.slice(0, 2))
 const wardrobe = computed(() => items.value.filter(item => filter.value === 'all' || item.category === filter.value))
@@ -62,7 +75,7 @@ const currentIds = computed(() => session.value?.at(index.value))
 const suggested = computed<Look | undefined>(() => currentIds.value
   ? { ids: currentIds.value, situation: recommendedSituation.value, mode: 'recommend' } : undefined)
 const manualRows = computed(() => categories.map(kind => {
-  const options = orderedItems(items.value, kind, situation.value)
+  const options = orderedItems(items.value, kind, situation.value, manualPool.value)
   const index = Math.max(0, options.findIndex(item => item.id === selection.value[kind]))
   return { kind, options, index, item: options[index] }
 }))
@@ -72,11 +85,22 @@ const manual = computed<Look>(() => {
   return { ids, situation: situation.value, mode: 'manual' }
 })
 const complete = computed(() => manualRows.value.every(row => row.item))
+const manualMissing = computed(() => manualRows.value.filter(row => !row.options.length).map(row => row.kind))
 const missingCategories = computed(() => categories.filter(kind => !items.value.some(item => item.category === kind)))
 const savedPreview = computed(() => preview.value && 'id' in preview.value ? preview.value : undefined)
 
 function show(next: Screen, tab = false) {
   if (busy.value) return
+  if (next !== screen.value && (screen.value === 'wardrobe' || screen.value === 'saved')) {
+    stopListPress()
+    longPressedItem = ''
+    listSelection.value = null
+  }
+  if (screen.value === 'item' && next !== 'item') {
+    analysis.value?.abort()
+    photoVersion++
+    photoDrafts.value = []
+  }
   if (tab) trail.value = []
   else if (next !== screen.value) trail.value.push(screen.value)
   screen.value = next
@@ -91,7 +115,9 @@ function back() {
   if (busy.value) return
   const next = trail.value.pop() ?? 'home'
   const rest = [...trail.value]
+  const selected = screen.value === 'manual' && next === 'wardrobe' ? manualPool.value : undefined
   show(next, true)
+  if (selected) listSelection.value = [...selected]
   trail.value = rest
 }
 
@@ -113,10 +139,10 @@ async function initialize() {
   try {
     const shared = token === 'fallback' ? undefined : await read('inbox', token)
     if (shared) {
-      await setPhoto(shared)
+      await preparePhotos([shared])
       await remove('inbox', token)
     }
-    if (!shared || !original.value) shareHint.value = '공유된 사진을 열 수 없어요. 사진 보관함에서 직접 선택해 주세요.'
+    if (!shared || !photoDrafts.value.length) shareHint.value = '공유된 사진을 열 수 없어요. 사진 보관함에서 직접 선택해 주세요.'
   } catch {
     shareHint.value = '공유된 사진을 열 수 없어요. 사진 보관함에서 직접 선택해 주세요.'
   } finally {
@@ -142,6 +168,7 @@ function openItem(item?: Item, kind?: Category) {
   replacingPhoto.value = false
   photoError.value = ''
   photoNotes.value = []
+  photoDrafts.value = []
   batch.value = []
   editId.value = item?.id ?? ''
   category.value = item?.category ?? kind ?? ''
@@ -149,15 +176,15 @@ function openItem(item?: Item, kind?: Category) {
   selectedTags.value = [...(item?.tags ?? [])]
   original.value = item?.original
   cutout.value = item?.cutout
+  useCutout.value = Boolean(item?.cutout && item.useCutout !== false)
+  sourceBounds.value = item?.sourceBounds
   photo.value = item?.photo
   appliedCrop.value = item?.crop ? { ...item.crop } : defaultCrop()
-  crop.value = { ...appliedCrop.value }
-  cropping.value = false
   shareHint.value = ''
   show('item')
 }
 
-async function suggestPhoto(file: Blob, signal: AbortSignal) {
+async function runPhotoTask<T>(task: () => Promise<T>, signal: AbortSignal) {
   if (signal.aborted) return
   let stop: () => void = () => {}
   const cancelled = new Promise<undefined>(resolve => {
@@ -165,16 +192,24 @@ async function suggestPhoto(file: Blob, signal: AbortSignal) {
     signal.addEventListener('abort', stop, { once: true })
   })
   try {
-    const task = import('~/utils/auto-photo').then(({ analyzePhoto }) => analyzePhoto(file, signal))
-    return await Promise.race([task, cancelled])
+    return await Promise.race([task(), cancelled])
   } catch {
-    if (!signal.aborted) return { cutout: undefined, category: '' as const, tags: [], notes: ['자동 처리를 불러오지 못했어요. 직접 선택해 주세요.'] }
+    return undefined
   } finally {
     signal.removeEventListener('abort', stop)
   }
 }
 
-async function setPhoto(file: Blob) {
+function removePhotoBackground(file: Blob, signal: AbortSignal) {
+  return runPhotoTask(async () => (await import('~/utils/auto-photo')).analyzeBackground(file), signal)
+}
+
+function classifyPhoto(file: Blob, signal: AbortSignal) {
+  return runPhotoTask(async () => (await import('~/utils/auto-photo')).analyzePhotoTags(file), signal)
+}
+
+async function setPhoto(draft: PhotoDraft) {
+  const { file, bounds } = draft
   const version = ++photoVersion
   const defaults = defaultCrop()
   processing.value = true
@@ -182,62 +217,102 @@ async function setPhoto(file: Blob) {
   photoError.value = ''
   photoNotes.value = []
   try {
-    const result = await cropPhoto(file, defaults)
+    const result = await cropPhoto(file, defaults, bounds)
     if (version !== photoVersion) return
     original.value = file
+    sourceBounds.value = selectedPhotoBounds(bounds)
     cutout.value = undefined
+    useCutout.value = false
     appliedCrop.value = defaults
-    crop.value = { ...defaults }
     photo.value = result
-    cropping.value = false
     const controller = new AbortController()
+    analyzingTags.value = false
     analysis.value = controller
-    const suggestion = await suggestPhoto(file, controller.signal)
-    if (version !== photoVersion || !suggestion) return
-    photoNotes.value = suggestion.notes
-    if (suggestion.cutout) {
-      const transparent = await cropPhoto(suggestion.cutout, defaults)
-      if (version !== photoVersion || controller.signal.aborted) return
-      cutout.value = suggestion.cutout
-      photo.value = transparent
+    const background = await removePhotoBackground(result, controller.signal)
+    if (version !== photoVersion) return
+    photoNotes.value = [background?.note ?? (controller.signal.aborted ? '누끼 처리를 건너뛰었어요.' : '누끼 모델을 열지 못해 자른 사진을 표시했어요.')]
+    if (background?.cutout) {
+      photo.value = cutout.value = background.cutout
+      useCutout.value = true
     }
-    if (!editId.value && !controller.signal.aborted) {
+    if (editId.value || draft.recrop || controller.signal.aborted) return
+    analyzingTags.value = true
+    const suggestion = await classifyPhoto(photo.value, controller.signal)
+    if (version !== photoVersion) return
+    if (suggestion) {
       if (suggestion.category) category.value = suggestion.category
       selectedTags.value = [...new Set([...selectedTags.value, ...suggestion.tags])]
+      photoNotes.value.push(...suggestion.notes)
+    } else if (!controller.signal.aborted) {
+      photoNotes.value.push('자동 분류를 불러오지 못했어요. 품목을 직접 선택해 주세요.')
     }
   } catch (cause) {
     if (version === photoVersion) {
       analysis.value = undefined
-      crop.value = { ...appliedCrop.value }
       photoError.value = (cause as Error).message
     }
   } finally {
     if (version === photoVersion) {
+      analysis.value = undefined
       processing.value = false
       replacingPhoto.value = false
     }
   }
 }
 
-function fileFrom(event: Event) {
-  const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
-  input.value = ''
-  return file
-}
-
-async function changePhoto(event: Event) {
-  const file = fileFrom(event)
-  if (file) await setPhoto(file)
-}
-
 async function choosePhotos(event: Event) {
   const input = event.target as HTMLInputElement
   const files = Array.from(input.files ?? [])
   input.value = ''
-  if (!files.length) return
-  if (files.length === 1 && !batch.value.length) {
-    await setPhoto(files[0]!)
+  await preparePhotos(files)
+}
+
+async function preparePhotos(files: Blob[]) {
+  if (!files.length || processing.value) return
+  if (!fitsPhotoUpload(batch.value.length + photoDrafts.value.length, files.length, uploadLimit.value)) {
+    error.value = `한 번에 사진을 최대 ${uploadLimit.value}장까지 선택할 수 있어요. 목록에서 빼거나 나눠서 등록해 주세요.`
+    return
+  }
+  error.value = ''
+  const version = ++photoVersion
+  processing.value = true
+  const drafts = files.map(file => ({ id: ++draftId, file,
+    label: file instanceof File ? file.name : '공유받은 옷 사진', bounds: fullPhotoBounds() }))
+  photoDrafts.value.push(...drafts)
+  activePhoto.value = drafts[0]!.id
+  for (const draft of photoDrafts.value.slice(-drafts.length)) {
+    if (version !== photoVersion) return
+    try {
+      await decodeImage(draft.file)
+    } catch (cause) {
+      draft.error = (cause as Error).message
+    }
+  }
+  if (version === photoVersion) processing.value = false
+}
+
+function removeDraft(id: number) {
+  photoDrafts.value = photoDrafts.value.filter(draft => draft.id !== id)
+  if (activePhoto.value === id) activePhoto.value = photoDrafts.value[0]?.id ?? 0
+  error.value = ''
+}
+
+function startRecrop() {
+  if (!original.value || processing.value) return
+  const rect = photoCropRect(100, 100, appliedCrop.value, sourceBounds.value)
+  const bounds = { left: rect.x, top: rect.y, right: rect.x + rect.width, bottom: rect.y + rect.height }
+  const id = ++draftId
+  activePhoto.value = id
+  photoDrafts.value = [{ id, file: original.value, label: '옷 원본 사진', bounds, recrop: true }]
+  error.value = ''
+}
+
+async function confirmPhotos() {
+  if (processing.value || !photoDrafts.value.length || photoDrafts.value.some(draft => draft.error)) return
+  const drafts = photoDrafts.value
+  photoDrafts.value = []
+  if (drafts.length === 1 && !batch.value.length) {
+    await setPhoto(drafts[0]!)
     return
   }
   const version = ++photoVersion
@@ -246,34 +321,39 @@ async function choosePhotos(event: Event) {
   replacingPhoto.value = true
   const start = batch.value.length
   const controller = new AbortController()
+  analyzingTags.value = false
   analysis.value = controller
-  batch.value.push(...files.map(file => ({ file, category: category.value, tags: [] })))
+  batch.value.push(...drafts.map(draft => ({ ...draft, category: category.value, tags: [] })))
   try {
-    for (const row of batch.value.slice(start)) {
+    const newRows = batch.value.slice(start)
+    for (const row of newRows) {
       if (version !== photoVersion) return
       try {
-        row.photo = await cropPhoto(row.file, defaultCrop())
+        row.photo = await cropPhoto(row.file, defaultCrop(), row.bounds)
       } catch (cause) {
         row.error = (cause as Error).message
         continue
       }
-      const suggestion = await suggestPhoto(row.file, controller.signal)
+      const background = await removePhotoBackground(row.photo, controller.signal)
       if (version !== photoVersion) return
-      if (!suggestion) continue
-      row.notes = suggestion.notes
-      row.category = suggestion.category || row.category
-      row.tags = suggestion.tags
-      if (suggestion.cutout) {
-        try {
-          const transparent = await cropPhoto(suggestion.cutout, defaultCrop())
-          if (controller.signal.aborted) continue
-          row.originalPreview = row.photo
-          row.cutout = suggestion.cutout
-          row.photo = transparent
-        } catch {
-          row.notes.push('투명 사진을 만들지 못해 원본을 사용했어요.')
-        }
+      row.notes = [background?.note ?? (controller.signal.aborted ? '누끼 처리를 건너뛰었어요.' : '누끼 모델을 열지 못해 자른 사진을 표시했어요.')]
+      if (background?.cutout) {
+        row.originalPreview = row.photo
+        row.photo = row.cutout = background.cutout
+        row.useCutout = true
       }
+    }
+    analyzingTags.value = true
+    for (const row of newRows) {
+      if (controller.signal.aborted || version !== photoVersion) return
+      if (!row.photo) continue
+      const suggestion = await classifyPhoto(row.photo, controller.signal)
+      if (version !== photoVersion || controller.signal.aborted) return
+      if (suggestion) {
+        row.category = suggestion.category || row.category
+        row.tags = suggestion.tags
+        row.notes?.push(...suggestion.notes)
+      } else row.notes?.push('자동 분류를 불러오지 못했어요. 품목을 직접 선택해 주세요.')
     }
   } finally {
     if (version === photoVersion) {
@@ -284,22 +364,25 @@ async function choosePhotos(event: Event) {
   }
 }
 
-async function adjustCrop() {
-  const file = cutout.value ?? original.value
-  if (!file || replacingPhoto.value) return
+const backgroundNote = (enabled: boolean) => enabled ? '배경을 제거했어요.' : '자른 사진의 원본 배경을 표시했어요.'
+
+async function togglePhotoBackground() {
+  const enabled = !useCutout.value
+  const file = enabled ? cutout.value : original.value
+  if (!file || processing.value) return
   const version = ++photoVersion
-  const nextCrop = { ...crop.value }
   processing.value = true
   photoError.value = ''
   try {
-    const result = await cropPhoto(file, nextCrop)
+    const result = enabled && appliedCrop.value.zoom === 1 ? file
+      : await cropPhoto(file, appliedCrop.value, enabled ? undefined : sourceBounds.value)
     if (version === photoVersion) {
       photo.value = result
-      appliedCrop.value = nextCrop
+      useCutout.value = enabled
+      photoNotes.value = [backgroundNote(enabled), ...photoNotes.value.slice(1)]
     }
   } catch (cause) {
     if (version === photoVersion) {
-      crop.value = { ...appliedCrop.value }
       photoError.value = (cause as Error).message
     }
   } finally {
@@ -307,13 +390,13 @@ async function adjustCrop() {
   }
 }
 
-async function useOriginalPhoto() {
-  if (!original.value) return
-  const source = cutout.value
-  const version = photoVersion + 1
-  cutout.value = undefined
-  await adjustCrop()
-  if (version === photoVersion && photoError.value) cutout.value = source
+function toggleBatchBackground(row: BatchPhoto) {
+  const enabled = !row.useCutout
+  const next = enabled ? row.cutout : row.originalPreview
+  if (!next) return
+  row.photo = next
+  row.useCutout = enabled
+  row.notes = [backgroundNote(enabled), ...(row.notes?.slice(1) ?? [])]
 }
 
 async function commit(action: () => Promise<void>, success: string, next?: () => void) {
@@ -341,7 +424,8 @@ async function saveItem() {
   const existing = items.value.find(item => item.id === editId.value)
   const now = Date.now()
   const item: Item = { id: existing?.id ?? crypto.randomUUID(), category: category.value, name: name.value.trim(),
-    tags: [...selectedTags.value], original: original.value, cutout: cutout.value, photo: photo.value, crop: { ...appliedCrop.value },
+    tags: [...selectedTags.value], original: original.value, cutout: cutout.value, useCutout: useCutout.value, photo: photo.value,
+    sourceBounds: sourceBounds.value, crop: { ...appliedCrop.value },
     created: existing?.created ?? now, modified: now }
   await commit(async () => {
     await write('items', item.id, item)
@@ -363,7 +447,8 @@ async function saveBatch() {
       return
     }
     entries.push({ id: crypto.randomUUID(), category: row.category, name: '', tags: [...row.tags],
-      original: row.file, cutout: row.cutout, photo: row.photo, crop: defaultCrop(), created: now, modified: now })
+      original: row.file, cutout: row.cutout, useCutout: row.useCutout, photo: row.photo, sourceBounds: selectedPhotoBounds(row.bounds),
+      crop: defaultCrop(), created: now, modified: now })
   }
   await commit(async () => {
     await writeItems(entries)
@@ -384,6 +469,60 @@ async function deleteItem() {
   }, '옷장에서 삭제했어요.', back)
 }
 
+function stopListPress() {
+  if (listPress) clearTimeout(listPress.timer)
+  listPress = undefined
+}
+
+function startListPress(event: PointerEvent, id: string) {
+  if (!event.isPrimary || event.button !== 0) return
+  stopListPress()
+  longPressedItem = ''
+  if (listSelection.value || busy.value) return
+  const timer = setTimeout(() => {
+    listPress = undefined
+    longPressedItem = id
+    listSelection.value = [id]
+  }, 500)
+  listPress = { timer, x: event.clientX, y: event.clientY, pointerId: event.pointerId }
+}
+
+function moveListPress(event: PointerEvent) {
+  if (listPress?.pointerId === event.pointerId
+    && Math.hypot(event.clientX - listPress.x, event.clientY - listPress.y) > 10) stopListPress()
+}
+
+function selectListEntry(event: MouseEvent, id: string, open: () => void) {
+  if (event.detail > 0 && longPressedItem === id) {
+    longPressedItem = ''
+    return
+  }
+  const selected = listSelection.value
+  if (!selected) {
+    open()
+    return
+  }
+  listSelection.value = selected.includes(id) ? selected.filter(key => key !== id) : [...selected, id]
+}
+
+async function deleteSelection(kind: 'items' | 'looks') {
+  const selected = listSelection.value
+  if (!selected?.length || busy.value) return
+  const clothes = kind === 'items'
+  const count = clothes ? `옷 ${selected.length}벌` : `저장 코디 ${selected.length}개`
+  const message = clothes
+    ? `선택한 ${count}과 사진을 삭제할까요? 저장 코디에는 삭제된 품목으로 표시돼요.`
+    : `선택한 ${count}를 삭제할까요?`
+  if (!window.confirm(message)) return
+  const ids = new Set(selected)
+  await commit(async () => {
+    await removeSelected(kind, selected)
+    if (clothes) items.value = items.value.filter(item => !ids.has(item.id))
+    else saved.value = saved.value.filter(look => !ids.has(look.id))
+    listSelection.value = null
+  }, `${count}${clothes ? '을' : '를'} 삭제했어요.`)
+}
+
 function startRecommendations() {
   recommendedSituation.value = ''
   started.value = false
@@ -399,11 +538,23 @@ function recommend(tag: Tag | '') {
   started.value = true
 }
 
-function startManual(look?: Look, kind?: Category) {
+function startManual(look?: Look, kind?: Category, pool?: ReadonlySet<string>) {
   situation.value = look?.situation ?? ''
   selection.value = look ? { ...look.ids } : emptySelection()
+  manualPool.value = pool
   show('manual')
   if (kind) nextTick(() => document.getElementById('manual-' + kind)?.scrollIntoView({ block: 'center' }))
+}
+
+function startSelectedOutfit() {
+  if (!listSelection.value?.length) return
+  startManual(undefined, undefined, new Set(listSelection.value))
+}
+
+function editOutfitSelection() {
+  if (!manualPool.value) return
+  show('wardrobe', true)
+  listSelection.value = [...manualPool.value]
 }
 
 function changeManualItem(row: typeof manualRows.value[number], direction: -1 | 1) {
@@ -414,6 +565,7 @@ function changeManualItem(row: typeof manualRows.value[number], direction: -1 | 
 
 function openPreview(look: Look | SavedLook) {
   preview.value = look
+  previewPool.value = screen.value === 'manual' ? manualPool.value : undefined
   show('preview')
 }
 
@@ -508,7 +660,18 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
       <section v-else-if="screen === 'wardrobe'">
         <div class="section-heading page-heading">
           <div><h1>내 옷장</h1><p>등록한 옷 {{ items.length }}벌</p></div>
-          <button class="button" @click="openItem(undefined, filter === 'all' ? undefined : filter)"><Plus :size="20" /> 옷 추가</button>
+          <div class="actions" v-if="listSelection === null">
+            <button v-if="items.length" class="button outline" @click="listSelection = []">선택</button>
+            <button class="button" @click="openItem(undefined, filter === 'all' ? undefined : filter)"><Plus :size="20" /> 옷 추가</button>
+          </div>
+        </div>
+        <div v-if="listSelection !== null" class="list-selection">
+          <strong role="status">{{ listSelection.length }}벌 선택</strong>
+          <div class="actions">
+            <button class="button outline small" :disabled="busy" @click="listSelection = null">선택 취소</button>
+            <button class="button outline small" :disabled="busy || !listSelection.length" @click="deleteSelection('items')">선택 삭제</button>
+            <button class="button small" :disabled="busy || !listSelection.length" @click="startSelectedOutfit">선택한 옷으로 코디</button>
+          </div>
         </div>
         <div class="chips" aria-label="품목 필터">
           <button class="chip" :aria-pressed="filter === 'all'" @click="filter = 'all'">전체</button>
@@ -516,10 +679,17 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
         </div>
         <div v-if="!wardrobe.length" class="empty">
           <Shirt :size="33" /><h2>{{ items.length ? '이 종류에 등록한 옷이 없어요' : '옷장이 비어 있어요' }}</h2>
-          <button class="button outline" @click="openItem(undefined, filter === 'all' ? undefined : filter)">옷 등록하기</button>
+          <button v-if="listSelection === null" class="button outline" @click="openItem(undefined, filter === 'all' ? undefined : filter)">옷 등록하기</button>
         </div>
         <div v-else class="wardrobe-grid">
-          <button v-for="item in wardrobe" :key="item.id" class="piece" @click="openItem(item)">
+          <button v-for="item in wardrobe" :key="item.id" type="button" class="piece selectable-card"
+            :disabled="busy" :aria-pressed="listSelection?.includes(item.id)"
+            @click="selectListEntry($event, item.id, () => openItem(item))" @pointerdown="startListPress($event, item.id)"
+            @pointermove="moveListPress" @pointerup="stopListPress" @pointercancel="stopListPress"
+            @pointerleave="stopListPress" @contextmenu.prevent>
+            <span v-if="listSelection !== null" class="selection-check" aria-hidden="true">
+              <Check v-if="listSelection.includes(item.id)" :size="16" />
+            </span>
             <BlobPhoto :blob="outfitPhoto(item)" :alt="item.name || labels[item.category]" />
             <span>{{ labels[item.category] }}</span><strong>{{ item.name || labels[item.category] }}</strong>
           </button>
@@ -528,19 +698,50 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
 
       <section v-else-if="screen === 'item'" class="narrow">
         <h1>{{ editId ? '옷 수정' : '옷 등록' }}</h1>
+        <aside v-if="!activeDraft && !analysis && !batch.length && !photo" class="upload-intro" aria-label="옷 등록 안내">
+          <strong><ImagePlus :size="21" /> 사진은 한 번에 최대 {{ uploadLimit }}장</strong>
+          <p>사진마다 자를 범위를 정하고 <b>확인하고 누끼 따기</b>를 누르면 배경을 자동으로 제거해요.</p>
+        </aside>
         <div v-if="analysis && !analysis.signal.aborted" class="inline-hint" role="status">
-          배경과 품목을 확인하고 있어요. 처음에는 모델을 내려받느라 시간이 걸릴 수 있어요.
-          <button type="button" class="text-button" @click="analysis.abort()">직접 입력하기</button>
+          {{ analyzingTags ? '품목과 상황 태그를 추천하고 있어요.' : '선택한 사진의 배경을 제거하고 있어요.' }}
+          <button type="button" class="text-button" @click="analysis.abort()">{{ analyzingTags ? '자동 분류 건너뛰기' : '누끼 처리 건너뛰기' }}</button>
         </div>
-        <form v-if="batch.length" class="form-stack" @submit.prevent="saveBatch">
+        <section v-if="activeDraft" class="form-stack panel" aria-label="사진 자르기">
+          <div class="section-heading">
+            <h2>사진별 자르기</h2>
+            <span class="hint">{{ batch.length + photoDrafts.length }} / {{ uploadLimit }}장</span>
+          </div>
+          <div class="chips" role="group" aria-label="자를 사진 선택">
+            <button v-for="(draft, idx) in photoDrafts" :key="draft.id" class="chip" type="button"
+              :aria-pressed="activePhoto === draft.id" @click="activePhoto = draft.id">사진 {{ idx + 1 }}</button>
+          </div>
+          <p v-if="processing" class="hint" role="status">선택한 사진을 확인하고 있어요…</p>
+          <p v-if="activeDraft.error" class="error" role="alert">{{ activeDraft.label }} · {{ activeDraft.error }}</p>
+          <template v-else>
+            <p class="hint">테두리의 손잡이를 끌어 남길 부분을 정하세요.</p>
+            <PhotoCropEditor :key="activeDraft.id" v-model="activeDraft.bounds" :file="activeDraft.file" :label="activeDraft.label" :disabled="processing" />
+          </template>
+          <div class="actions uploads">
+            <button v-if="!activeDraft.error" class="text-button" type="button" :disabled="processing" @click="activeDraft.bounds = fullPhotoBounds()">전체 사진으로 초기화</button>
+            <button class="button outline small" type="button" :disabled="processing" @click="removeDraft(activeDraft.id)">이 사진 빼기</button>
+            <label v-if="batch.length + photoDrafts.length < uploadLimit" class="button outline small">
+              <ImagePlus :size="18" /> 사진 더 선택<input class="file-input" aria-label="사진 더 선택" type="file" accept="image/*" multiple :disabled="processing" @change="choosePhotos">
+            </label>
+            <button class="button outline small" type="button" :disabled="processing" @click="photoDrafts = []; error = ''">자르기 취소</button>
+            <button class="button" type="button" :disabled="processing || photoDrafts.some(draft => draft.error)" @click="confirmPhotos">확인하고 누끼 따기</button>
+          </div>
+          <p v-if="photoDrafts.some(draft => draft.error)" class="hint">열 수 없는 사진을 목록에서 빼면 계속할 수 있어요.</p>
+        </section>
+        <form v-else-if="batch.length" class="form-stack" @submit.prevent="saveBatch">
           <p class="hint">사진마다 종류와 상황 태그를 확인하세요. 별칭과 사진 자르기는 등록 후 옷장에서 수정할 수 있어요.</p>
           <p v-if="processing" class="hint" role="status">사진을 처리하고 있어요…</p>
-          <fieldset v-for="(row, i) in batch" :key="row.file.name + ':' + i" :disabled="busy || processing">
+          <fieldset v-for="(row, i) in batch" :key="row.id" :disabled="busy || processing">
             <legend>사진 {{ i + 1 }}</legend>
-            <BlobPhoto v-if="row.photo" class="batch-preview" :blob="row.photo" :alt="row.file.name" />
-            <p v-if="row.error" class="error" role="alert">{{ row.file.name }} · {{ row.error }}</p>
-            <p v-for="note in row.notes" :key="note" class="hint">{{ note }}</p>
-            <button v-if="row.cutout" class="text-button" type="button" @click="row.photo = row.originalPreview; row.cutout = undefined">원본 배경 사용</button>
+            <BlobPhoto v-if="row.photo" class="batch-preview" :class="{ 'cutout-preview': row.useCutout }" :blob="row.photo" :alt="row.label" />
+            <p v-if="row.error" class="error" role="alert">{{ row.label }} · {{ row.error }}</p>
+            <p v-for="note in row.notes" :key="note" class="photo-feedback" role="status">{{ note }}</p>
+            <button v-if="row.cutout" class="button outline small" type="button" role="switch" aria-label="배경 제거"
+              :aria-checked="Boolean(row.useCutout)" @click="toggleBatchBackground(row)">누끼 {{ row.useCutout ? '켜짐' : '꺼짐' }}</button>
             <label class="field">품목 종류
               <select v-model="row.category" required :aria-label="'사진 ' + (i + 1) + ' 품목 종류'">
                 <option value="" disabled>종류 선택</option>
@@ -553,31 +754,26 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
             <button class="text-button" type="button" :aria-label="'사진 ' + (i + 1) + ' 제외'" @click="batch.splice(i, 1)">목록에서 빼기</button>
           </fieldset>
           <div class="actions uploads">
-            <label class="button outline small"><ImagePlus :size="18" /> 사진 더 선택<input class="file-input" aria-label="사진 더 선택" type="file" accept="image/*" multiple :disabled="busy || processing" @change="choosePhotos"></label>
+            <label v-if="batch.length < uploadLimit" class="button outline small"><ImagePlus :size="18" /> 사진 더 선택<input class="file-input" aria-label="사진 더 선택" type="file" accept="image/*" multiple :disabled="busy || processing" @change="choosePhotos"></label>
             <button class="button" type="submit" :disabled="busy || processing">옷 {{ batch.length }}벌 한 번에 저장</button>
           </div>
         </form>
         <form v-else class="form-stack" @submit.prevent="saveItem">
           <fieldset :disabled="busy || replacingPhoto">
             <legend>옷 사진</legend>
-            <BlobPhoto v-if="photo" class="crop-preview" :blob="photo" alt="저장할 옷 사진 미리보기" />
+            <BlobPhoto v-if="photo" class="crop-preview" :class="{ 'cutout-preview': useCutout }" :blob="photo" alt="저장할 옷 사진 미리보기" />
             <div class="actions uploads">
               <label class="button outline small"><ImagePlus :size="18" /> 사진 보관함<input class="file-input" aria-label="사진 보관함" type="file" accept="image/*" :multiple="!editId && !photo" @change="choosePhotos"></label>
-              <label class="button outline small"><Camera :size="18" /> 카메라<input class="file-input" aria-label="카메라" type="file" accept="image/*" capture="environment" @change="changePhoto"></label>
-              <button v-if="photo" class="button outline small" type="button" :aria-expanded="cropping" @click="cropping = !cropping">{{ cropping ? '자르기 닫기' : '사진 자르기' }}</button>
-              <button v-if="cutout" class="text-button" type="button" :disabled="processing" @click="useOriginalPhoto">원본 배경 사용</button>
+              <label class="button outline small"><Camera :size="18" /> 카메라<input class="file-input" aria-label="카메라" type="file" accept="image/*" capture="environment" @change="choosePhotos"></label>
+              <button v-if="photo" class="button outline small" type="button" :disabled="processing" @click="startRecrop">사진 다시 자르기</button>
+              <button v-if="cutout" class="button outline small" type="button" role="switch" aria-label="배경 제거"
+                :aria-checked="useCutout" :disabled="processing" @click="togglePhotoBackground">누끼 {{ useCutout ? '켜짐' : '꺼짐' }}</button>
             </div>
             <p class="hint">{{ shareHint || '공유 메뉴에서 앱이 보이지 않으면 사진을 저장한 뒤 보관함에서 선택해 주세요.' }}</p>
-            <p v-if="!editId && !photo" class="hint">보관함에서 여러 장을 선택하면 한 번에 등록할 수 있어요.</p>
             <p class="hint">카메라나 사진 보관함이 열리지 않으면 기기의 접근 권한을 확인하거나 다른 사진 입력 방법을 사용해 주세요.</p>
             <p v-if="processing" class="hint" role="status">사진을 처리하고 있어요…</p>
             <p v-if="photoError" class="error" role="alert">{{ photoError }}</p>
-            <p v-for="note in photoNotes" :key="note" class="hint">{{ note }}</p>
-            <div v-if="cropping" class="crop-controls">
-              <label>확대 <input v-model.number="crop.zoom" type="range" min="1" max="3" step=".05" @input="adjustCrop"></label>
-              <label>가로 위치 <input v-model.number="crop.x" type="range" min="0" max="100" @input="adjustCrop"></label>
-              <label>세로 위치 <input v-model.number="crop.y" type="range" min="0" max="100" @input="adjustCrop"></label>
-            </div>
+            <p v-for="note in photoNotes" :key="note" class="photo-feedback" role="status">{{ note }}</p>
           </fieldset>
           <fieldset :disabled="busy"><legend>품목 종류</legend>
             <div class="chips"><button v-for="kind in categories" :key="kind" type="button" class="chip" :aria-pressed="category === kind" @click="category = kind">{{ labels[kind] }}</button></div>
@@ -628,9 +824,14 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
         <label class="field situation-field">상황 <span>선택</span>
           <select v-model="situation"><option value="">상황 선택 안 함</option><option v-for="tag in tags" :key="tag">{{ tag }}</option></select>
         </label>
-        <div v-if="missingCategories.length" class="inline-hint">
-          {{ missingCategories.map(kind => labels[kind]).join(', ') }}을(를) 옷장에 추가해 주세요.
-          <button class="text-button" @click="openItem(undefined, missingCategories[0])">옷 추가 <ArrowRight :size="16" /></button>
+        <div v-if="manualPool" class="inline-hint">
+          선택한 옷 {{ manualPool.size }}벌로 코디하고 있어요.
+          <button class="text-button" @click="editOutfitSelection">선택 바꾸기 <ArrowRight :size="16" /></button>
+          <p v-if="manualMissing.length">코디를 저장하려면 {{ manualMissing.map(kind => labels[kind]).join(', ') }}도 선택해 주세요.</p>
+        </div>
+        <div v-else-if="manualMissing.length" class="inline-hint">
+          {{ manualMissing.map(kind => labels[kind]).join(', ') }}을(를) 옷장에 추가해 주세요.
+          <button class="text-button" @click="openItem(undefined, manualMissing[0])">옷 추가 <ArrowRight :size="16" /></button>
         </div>
         <div class="outfit-stage">
           <section v-for="row in manualRows" :id="'manual-' + row.kind" :key="row.kind" class="outfit-row" :aria-label="labels[row.kind]">
@@ -638,6 +839,7 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
               :aria-label="labels[row.kind] + ' 이전'" @click="changeManualItem(row, -1)">이전</button>
             <div class="outfit-slot" :class="row.kind" aria-live="polite">
               <BlobPhoto v-if="row.item" :blob="outfitPhoto(row.item)" :alt="row.item.name || labels[row.kind]" />
+              <small v-else-if="manualPool">선택한 {{ labels[row.kind] }} 없음</small>
               <button v-else class="button outline small" @click="openItem(undefined, row.kind)">{{ labels[row.kind] }} 추가</button>
               <small v-if="row.item">{{ row.item.name || labels[row.kind] }} · {{ row.index + 1 }} / {{ row.options.length }}</small>
             </div>
@@ -657,7 +859,7 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
           <p v-if="preview.situation" class="hint">{{ preview.situation }}</p>
           <p v-if="savedPreview" class="hint">저장한 날짜 · {{ lookDate(savedPreview.saved) }}</p>
           <LookCard :items="items" :look="preview" :vertical="Boolean(savedPreview) || preview.mode === 'manual'"
-            :photo-first="Boolean(savedPreview)" editable @replace="startManual(preview, $event)" />
+            :photo-first="Boolean(savedPreview)" editable @replace="startManual(preview, $event, previewPool)" />
           <div class="actions">
             <button v-if="!savedPreview" class="button" :disabled="busy" @click="saveLook(preview)"><Bookmark :size="17" /> 코디 저장</button>
             <button v-else class="button outline danger" :disabled="busy" @click="deleteLook(savedPreview.id)">저장 코디 삭제</button>
@@ -666,7 +868,17 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
       </section>
 
       <section v-else-if="screen === 'saved'" class="narrow">
-        <div class="page-heading"><h1>저장 코디</h1></div>
+        <div class="section-heading page-heading">
+          <h1>저장 코디</h1>
+          <button v-if="saved.length && listSelection === null" class="button outline" @click="listSelection = []">선택</button>
+        </div>
+        <div v-if="listSelection !== null" class="list-selection">
+          <strong role="status">{{ listSelection.length }}개 선택</strong>
+          <div class="actions">
+            <button class="button outline small" :disabled="busy" @click="listSelection = null">선택 취소</button>
+            <button class="button small" :disabled="busy || !listSelection.length" @click="deleteSelection('looks')">선택 삭제</button>
+          </div>
+        </div>
         <div v-if="saved.length" class="chips saved-filters" role="group" aria-label="저장 코디 상황 필터">
           <button class="chip" :aria-pressed="savedFilter === 'all'" @click="savedFilter = 'all'">전체</button>
           <button v-for="tag in tags" :key="tag" class="chip" :aria-pressed="savedFilter === tag" @click="savedFilter = tag">{{ tag }}</button>
@@ -680,8 +892,15 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
         <p v-else-if="!visibleSaved.length" class="hint" role="status">이 상황에 저장한 코디가 없어요.</p>
         <div v-else class="saved-list">
           <article v-for="look in visibleSaved" :key="look.id" class="saved-entry">
-            <h2><button class="saved-entry-open" @click="openPreview(look)">{{ look.situation || '나의 코디' }}
-              <ChevronRight :size="18" aria-hidden="true" />
+            <h2><button class="saved-entry-open selectable-card" type="button"
+              :disabled="busy" :aria-pressed="listSelection?.includes(look.id)"
+              @click="selectListEntry($event, look.id, () => openPreview(look))" @pointerdown="startListPress($event, look.id)"
+              @pointermove="moveListPress" @pointerup="stopListPress" @pointercancel="stopListPress"
+              @pointerleave="stopListPress" @contextmenu.prevent>{{ look.situation || '나의 코디' }}
+              <span v-if="listSelection !== null" class="selection-check" aria-hidden="true">
+                <Check v-if="listSelection.includes(look.id)" :size="14" />
+              </span>
+              <ChevronRight v-else :size="18" aria-hidden="true" />
             </button></h2>
             <LookCard :items="items" :look="look" vertical photo-first />
           </article>
