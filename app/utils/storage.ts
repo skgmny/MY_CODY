@@ -1,6 +1,6 @@
-import type { Item, SavedLook } from './outfits'
+import type { Item, SavedLook, Tag } from './outfits'
 
-type Stores = { items: Item; looks: SavedLook; inbox: Blob; setup: boolean }
+type Stores = { items: Item; looks: SavedLook; inbox: Blob; setup: boolean | Tag }
 export const starterClothesKey = 'starter-clothes'
 let connection: Promise<IDBDatabase> | undefined
 
@@ -79,6 +79,18 @@ export const read = <K extends keyof Stores>(name: K, key: string) =>
   transact(name, 'readonly', store => store.get(key)) as Promise<Stores[K] | undefined>
 export const write = <K extends keyof Stores>(name: K, key: string, value: Stores[K]) =>
   transact(name, 'readwrite', store => store.put(value, key))
+
+export async function saveCustomSituation(name: Tag) {
+  const key = `situation:${name.toLowerCase()}`
+  const stored = await transact('setup', 'readwrite', store => {
+    const request: IDBRequest<Tag | undefined> = store.get(key)
+    request.onsuccess = () => {
+      if (request.result === undefined) store.add(name, key)
+    }
+    return request
+  })
+  return stored ?? name
+}
 
 export type LookDetailsPatch = Partial<Pick<SavedLook, 'title' | 'situation' | 'memo'>>
 const lookDraftKey = (id: string) => `oneday-closet:look-draft:${id}`

@@ -3,7 +3,7 @@ import { ArrowLeft, ArrowRight, Bookmark, Camera, Check, ChevronRight, Heart, Ho
   Layers3, Plus, Shirt, Sparkles } from 'lucide-vue-next'
 import { categories, labels, orderedItems, outfitPhoto, recommendation, resolveItems, tags,
   type Category, type Item, type Look, type SavedLook, type Selection, type Tag } from '~/utils/outfits'
-import { clearLookDetails, pendingLookDetails, persistLookDetails, read, readAll, remove, removeSelected, write, writeItems,
+import { clearLookDetails, pendingLookDetails, persistLookDetails, read, readAll, remove, removeSelected, saveCustomSituation, write, writeItems,
   type LookDetailsPatch } from '~/utils/storage'
 import { initializeStarterClothes, isStarterItem } from '~/utils/starter-clothes'
 import { cropPhoto, decodeImage, defaultCrop, fitsPhotoUpload, fullPhotoBounds, photoCropRect, photoUploadLimit,
@@ -21,10 +21,18 @@ const trail = ref<Screen[]>([])
 const main = ref<HTMLElement>()
 const items = shallowRef<Item[]>([])
 const saved = shallowRef<SavedLook[]>([])
-const savedFilter = ref<Tag | '' | 'all'>('all')
-const visibleSaved = computed(() => savedFilter.value === 'all'
+const savedFilter = ref<Tag | null>(null)
+const visibleSaved = computed(() => savedFilter.value === null
   ? saved.value
   : saved.value.filter(look => look.situation === savedFilter.value))
+const customSituations = ref<Tag[]>([])
+const situationOptions = computed(() => [...tags, ...customSituations.value])
+const situationDialog = ref<HTMLDialogElement>()
+const situationName = ref('')
+const situationError = ref('')
+const savingSituation = ref(false)
+const situationNameLimit = 20
+let selectAddedSituation: ((tag: Tag) => void) | undefined
 const ready = ref(false)
 const loadError = ref('')
 const error = ref('')
@@ -75,6 +83,8 @@ const pickerKind = ref<Category>()
 const outfitPicker = ref<HTMLDialogElement>()
 const preview = shallowRef<Look | SavedLook>()
 const previewPool = shallowRef<ReadonlySet<string>>()
+const lookTitleLimit = 30
+const lookMemoLimit = 300
 const lookDetails = ref<{ title: string; situation: Tag | ''; memo: string }>()
 const memoExpanded = ref(false)
 const memoEditor = ref<HTMLTextAreaElement>()
@@ -139,7 +149,8 @@ async function initialize() {
     await initializeStarterClothes().catch(() => {
       showNotice('예시 옷을 불러오지 못했어요. 옷을 직접 추가할 수 있어요.')
     })
-    const [clothes, looks] = await Promise.all([readAll('items'), readAll('looks')])
+    const [clothes, looks, setup] = await Promise.all([readAll('items'), readAll('looks'), readAll('setup')])
+    customSituations.value = setup.filter((value): value is Tag => typeof value === 'string')
     items.value = clothes.sort((a, b) => b.created - a.created)
     saved.value = looks.map(look => {
       const pending = pendingLookDetails(look.id)
@@ -193,6 +204,39 @@ function showNotice(message: string) {
 }
 
 onBeforeUnmount(dismissNotice)
+
+function openSituationDialog(select?: (tag: Tag) => void) {
+  if (busy.value || savingSituation.value) return
+  situationName.value = ''
+  situationError.value = ''
+  selectAddedSituation = select
+  situationDialog.value?.showModal()
+}
+
+async function addSituation() {
+  if (savingSituation.value) return
+  const name = situationName.value.normalize('NFC').trim().replace(/\s+/g, ' ')
+  if (!name || name.length > situationNameLimit) {
+    situationError.value = `상황 이름을 1~${situationNameLimit}자로 입력해 주세요.`
+    return
+  }
+  if ([...situationOptions.value, '전체', '상황 미지정', '상황 선택 안 함'].some(tag => tag.toLowerCase() === name.toLowerCase())) {
+    situationError.value = '이미 목록에 있는 이름이에요. 다른 이름을 입력해 주세요.'
+    return
+  }
+  savingSituation.value = true
+  situationError.value = ''
+  try {
+    const tag = await saveCustomSituation(name)
+    customSituations.value.push(tag)
+    selectAddedSituation?.(tag)
+    situationDialog.value?.close()
+  } catch {
+    situationError.value = '상황을 저장하지 못했어요. 다시 시도해 주세요.'
+  } finally {
+    savingSituation.value = false
+  }
+}
 
 function openItem(item?: Item, kind?: Category) {
   analysis.value?.abort()
@@ -698,11 +742,24 @@ function saveLookDetails(change: LookDetailsPatch) {
 
 function saveLookText(field: 'title' | 'memo', event: Event) {
   const input = event.target as HTMLInputElement | HTMLTextAreaElement
-  saveLookDetails({ [field]: field === 'title' ? input.value.trim() : input.value })
+  const previous = savedPreview.value?.[field] ?? ''
+  const limit = Math.max(field === 'title' ? lookTitleLimit : lookMemoLimit, previous.length)
+  const value = input.value.length > limit ? input.value.slice(0, limit).replace(/[\uD800-\uDBFF]$/, '') : input.value
+  if (input.value !== value && !(event instanceof InputEvent && event.isComposing)) {
+    input.value = value
+    if (lookDetails.value) lookDetails.value[field] = value
+  }
+  saveLookDetails({ [field]: field === 'title' ? value.trim() : value })
 }
 
 function saveLookSituation(event: Event) {
-  saveLookDetails({ situation: (event.target as HTMLSelectElement).value as Tag | '' })
+  setSavedSituation((event.target as HTMLSelectElement).value)
+}
+
+function setSavedSituation(tag: Tag) {
+  if (!lookDetails.value) return
+  lookDetails.value.situation = tag
+  saveLookDetails({ situation: tag })
 }
 
 async function saveLook(look: Look) {
@@ -786,7 +843,7 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
           </section>
         </div>
         <section v-if="recent.length">
-          <div class="section-heading"><h2>최근 저장한 코디</h2><button class="text-button" @click="savedFilter = 'all'; show('saved', true)">모두 보기 <ChevronRight :size="16" /></button></div>
+          <div class="section-heading"><h2>최근 저장한 코디</h2><button class="text-button" @click="savedFilter = null; show('saved', true)">모두 보기 <ChevronRight :size="16" /></button></div>
           <div class="saved-list recent-list">
             <article v-for="look in recent" :key="look.id" class="saved-entry">
               <h3><button class="saved-entry-open" @click="openPreview(look)">{{ lookTitle(look) }}
@@ -891,7 +948,8 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
               </select>
             </label>
             <div class="chips" :aria-label="'사진 ' + (i + 1) + ' 상황 태그'">
-              <label v-for="tag in tags" :key="tag" class="chip tag"><input v-model="row.tags" type="checkbox" :value="tag">{{ tag }}</label>
+              <label v-for="tag in situationOptions" :key="tag" class="chip tag"><input v-model="row.tags" type="checkbox" :value="tag">{{ tag }}</label>
+              <button class="chip" type="button" @click="openSituationDialog(tag => row.tags.push(tag))"><Plus :size="16" /> 상황 추가</button>
             </div>
             <button class="text-button" type="button" :aria-label="'사진 ' + (i + 1) + ' 제외'" @click="batch.splice(i, 1)">목록에서 빼기</button>
           </fieldset>
@@ -924,7 +982,8 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
           <label class="field">별칭 <span>선택</span><input v-model="name" :disabled="busy" maxlength="40" placeholder="예: 아이보리 니트"></label>
           <fieldset :disabled="busy"><legend>상황 태그 <span>선택</span></legend>
             <div class="chips">
-              <label v-for="tag in tags" :key="tag" class="chip tag"><input v-model="selectedTags" type="checkbox" :value="tag">{{ tag }}</label>
+              <label v-for="tag in situationOptions" :key="tag" class="chip tag"><input v-model="selectedTags" type="checkbox" :value="tag">{{ tag }}</label>
+              <button class="chip" type="button" @click="openSituationDialog(tag => selectedTags.push(tag))"><Plus :size="16" /> 상황 추가</button>
             </div>
           </fieldset>
           <div class="actions"><button class="button" :disabled="busy || processing" type="submit">옷 저장하기</button>
@@ -939,7 +998,7 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
         <h1>코디 추천</h1>
         <div v-if="!started" class="panel">
           <h2>어디에 입고 가나요?</h2><p>상황을 골라 옷장 속 코디를 찾아보세요.</p>
-          <div class="chips"><button v-for="tag in tags" :key="tag" class="chip" @click="recommend(tag)">{{ tag }}</button></div>
+          <div class="chips"><button v-for="tag in situationOptions" :key="tag" class="chip" @click="recommend(tag)">{{ tag }}</button></div>
           <button class="button outline" @click="recommend('')">상황 선택 안 함 <ArrowRight :size="17" /></button>
         </div>
         <div v-else-if="suggested" class="panel">
@@ -966,9 +1025,12 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
 
       <section v-else-if="screen === 'manual'" class="narrow">
         <h1>직접 코디</h1>
-        <label class="field situation-field">상황 <span>선택</span>
-          <select v-model="situation"><option value="">상황 선택 안 함</option><option v-for="tag in tags" :key="tag">{{ tag }}</option></select>
-        </label>
+        <div class="actions situation-controls situation-field">
+          <label class="field">상황 <span>선택</span>
+            <select v-model="situation"><option value="">상황 선택 안 함</option><option v-for="tag in situationOptions" :key="tag" :value="tag">{{ tag }}</option></select>
+          </label>
+          <button class="button outline small" type="button" @click="openSituationDialog(tag => situation = tag)"><Plus :size="16" /> 상황 추가</button>
+        </div>
         <div v-if="manualPool" class="inline-hint">
           선택한 옷 {{ manualPool.size }}벌로 코디하고 있어요.
           <button class="text-button" @click="editOutfitSelection">선택 바꾸기 <ArrowRight :size="16" /></button>
@@ -1020,29 +1082,39 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
 
       <section v-else-if="screen === 'preview' && preview" class="narrow">
         <h1 v-if="!savedPreview">코디 미리보기</h1>
-        <div :class="savedPreview || preview.mode === 'manual' ? 'outfit-stage' : 'panel'">
+        <div :class="{ 'outfit-stage': savedPreview || preview.mode === 'manual', panel: !savedPreview && preview.mode !== 'manual',
+          'saved-outfit-detail': savedPreview }">
           <div v-if="savedPreview && lookDetails" class="saved-detail-fields">
             <label class="field">제목
+              <small id="look-title-count" class="look-title-count hint" aria-hidden="true">{{ lookDetails.title.length }} / {{ lookTitleLimit }}</small>
               <input v-model="lookDetails.title" class="saved-title-input" :placeholder="lookDetails.situation || '나의 코디'"
-                :disabled="busy" @input="saveLookText('title', $event)">
+                :maxlength="lookTitleLimit" aria-describedby="look-title-count" :disabled="busy" @input="saveLookText('title', $event)">
             </label>
-            <label class="field situation-field">상황
-              <select v-model="lookDetails.situation" :disabled="busy" @change="saveLookSituation">
-                <option value="">상황 미지정</option>
-                <option v-for="tag in tags" :key="tag" :value="tag">{{ tag }}</option>
-              </select>
-            </label>
-            <p class="hint">변경사항은 자동으로 저장돼요.</p>
+            <div class="actions situation-controls situation-field">
+              <label class="field">상황
+                <select v-model="lookDetails.situation" :disabled="busy" @change="saveLookSituation">
+                  <option value="">상황 미지정</option>
+                  <option v-for="tag in situationOptions" :key="tag" :value="tag">{{ tag }}</option>
+                </select>
+              </label>
+              <button class="button outline small" type="button" :disabled="busy" @click="openSituationDialog(setSavedSituation)"><Plus :size="16" /> 상황 추가</button>
+            </div>
           </div>
           <p v-else-if="preview.situation" class="hint">{{ preview.situation }}</p>
-          <p v-if="savedPreview" class="hint">저장한 날짜 · {{ lookDate(savedPreview.saved) }}</p>
           <LookCard :items="items" :look="preview" :vertical="Boolean(savedPreview) || preview.mode === 'manual'"
             :photo-first="Boolean(savedPreview)" editable @replace="startManual(preview, $event, previewPool)" />
+          <div v-if="savedPreview" class="saved-detail-notes hint">
+            <p>저장한 날짜 · {{ lookDate(savedPreview.saved) }}</p>
+            <p>변경사항은 자동으로 저장돼요.</p>
+          </div>
           <section v-if="lookDetails" class="saved-memo" aria-labelledby="saved-memo-title">
-            <h2 id="saved-memo-title">메모</h2>
+            <div class="saved-memo-heading">
+              <h2 id="saved-memo-title">메모</h2>
+              <small v-if="memoExpanded" id="look-memo-count" class="hint">{{ lookDetails.memo.length }} / {{ lookMemoLimit }}</small>
+            </div>
             <div v-if="memoExpanded" class="field">
-              <textarea ref="memoEditor" v-model="lookDetails.memo" class="saved-memo-editor" rows="4"
-                aria-label="메모" :disabled="busy" @input="saveLookText('memo', $event)" />
+              <textarea ref="memoEditor" v-model="lookDetails.memo" class="saved-memo-editor" rows="4" :maxlength="lookMemoLimit"
+                aria-label="메모" aria-describedby="look-memo-count" :disabled="busy" @input="saveLookText('memo', $event)" />
               <button class="text-button" type="button" @click="toggleMemo">메모 접기</button>
             </div>
             <button v-else ref="memoTrigger" class="saved-memo-toggle" type="button" aria-expanded="false" @click="toggleMemo">
@@ -1060,7 +1132,10 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
       <section v-else-if="screen === 'saved'" class="narrow">
         <div class="section-heading page-heading">
           <h1>저장 코디</h1>
-          <button v-if="saved.length && listSelection === null" class="button outline" @click="listSelection = []">선택</button>
+          <div v-if="listSelection === null" class="actions">
+            <button class="button outline small" type="button" @click="openSituationDialog()"><Plus :size="16" /> 상황 추가</button>
+            <button v-if="saved.length" class="button outline" @click="listSelection = []">선택</button>
+          </div>
         </div>
         <div v-if="listSelection !== null" class="list-selection">
           <strong role="status">{{ listSelection.length }}개 선택</strong>
@@ -1070,8 +1145,8 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
           </div>
         </div>
         <div v-if="saved.length" class="chips saved-filters" role="group" aria-label="저장 코디 상황 필터">
-          <button class="chip" :aria-pressed="savedFilter === 'all'" @click="savedFilter = 'all'">전체</button>
-          <button v-for="tag in tags" :key="tag" class="chip" :aria-pressed="savedFilter === tag" @click="savedFilter = tag">{{ tag }}</button>
+          <button class="chip" :aria-pressed="savedFilter === null" @click="savedFilter = null">전체</button>
+          <button v-for="tag in situationOptions" :key="tag" class="chip" :aria-pressed="savedFilter === tag" @click="savedFilter = tag">{{ tag }}</button>
           <button class="chip" :aria-pressed="savedFilter === ''" @click="savedFilter = ''">상황 미지정</button>
         </div>
         <div v-if="!saved.length" class="empty">
@@ -1099,6 +1174,21 @@ const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 �
 
     </template>
   </main>
+
+  <dialog ref="situationDialog" class="outfit-picker" aria-labelledby="add-situation-title" @cancel="savingSituation && $event.preventDefault()">
+    <form class="form-stack" @submit.prevent="addSituation">
+      <h2 id="add-situation-title">상황 추가</h2>
+      <label class="field">상황 이름
+        <input v-model="situationName" :maxlength="situationNameLimit" placeholder="예: 출근" autofocus
+          :disabled="savingSituation" @input="situationError = ''">
+      </label>
+      <p v-if="situationError" class="error" role="alert">{{ situationError }}</p>
+      <div class="actions">
+        <button class="button small" type="submit" :disabled="savingSituation">추가하기</button>
+        <button class="button outline small" type="button" :disabled="savingSituation" @click="situationDialog?.close()">취소</button>
+      </div>
+    </form>
+  </dialog>
 
   <nav class="bottom-nav" aria-label="주 메뉴">
     <div class="nav-inner">

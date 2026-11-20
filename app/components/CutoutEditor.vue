@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ArrowLeft, ArrowRight } from 'lucide-vue-next'
 import { cutoutPreview, decodeImage, transparentPhoto } from '~/utils/images'
 
 const props = defineProps<{ source: Blob; initialMask?: Blob }>()
@@ -10,8 +11,12 @@ const brush = ref(24)
 const ready = ref(false)
 const saving = ref(false)
 const error = ref('')
+const drawing = ref(false)
+const historyLimit = 10
+const maskHistory = shallowReactive<ImageData[]>([])
+const historyIndex = ref(0)
 let source: HTMLImageElement
-let initialMask: HTMLImageElement | undefined
+let initialState: ImageData
 let mask: HTMLCanvasElement
 let stroke: { pointer: number; x: number; y: number } | undefined
 
@@ -26,17 +31,37 @@ function render() {
   context.globalCompositeOperation = 'source-over'
 }
 
-function reset() {
-  const context = mask.getContext('2d')!
-  context.globalCompositeOperation = 'source-over'
-  context.clearRect(0, 0, mask.width, mask.height)
-  if (initialMask) context.drawImage(initialMask, 0, 0, mask.width, mask.height)
-  else {
-    context.fillStyle = 'white'
-    context.fillRect(0, 0, mask.width, mask.height)
-  }
+function maskSnapshot() {
+  return mask.getContext('2d')!.getImageData(0, 0, mask.width, mask.height)
+}
+
+function recordMask(snapshot: ImageData) {
+  maskHistory.splice(historyIndex.value + 1)
+  maskHistory.push(snapshot)
+  // Keep the number of full-size snapshots bounded for mobile devices.
+  if (maskHistory.length > historyLimit + 1) maskHistory.shift()
+  historyIndex.value = maskHistory.length - 1
+}
+
+function restoreMask(snapshot: ImageData) {
+  mask.getContext('2d')!.putImageData(snapshot, 0, 0)
   error.value = ''
   render()
+}
+
+function moveHistory(direction: -1 | 1) {
+  if (drawing.value || saving.value) return
+  const index = historyIndex.value + direction
+  const snapshot = maskHistory[index]
+  if (!snapshot) return
+  historyIndex.value = index
+  restoreMask(snapshot)
+}
+
+function reset() {
+  if (!ready.value || drawing.value || saving.value || maskHistory[historyIndex.value] === initialState) return
+  restoreMask(initialState)
+  recordMask(initialState)
 }
 
 onMounted(async () => {
@@ -49,11 +74,18 @@ onMounted(async () => {
     const canvas = preview.value
     if (!canvas) return
     source = image
-    initialMask = startingMask
     mask = document.createElement('canvas')
     canvas.width = mask.width = image.naturalWidth
     canvas.height = mask.height = image.naturalHeight
-    reset()
+    const context = mask.getContext('2d')!
+    if (startingMask) context.drawImage(startingMask, 0, 0, mask.width, mask.height)
+    else {
+      context.fillStyle = 'white'
+      context.fillRect(0, 0, mask.width, mask.height)
+    }
+    initialState = maskSnapshot()
+    maskHistory.push(initialState)
+    render()
     ready.value = true
   } catch {
     error.value = '사진을 편집 화면에서 열지 못했어요.'
@@ -74,6 +106,8 @@ function paint(event: PointerEvent, start = false) {
   context.beginPath()
   if (start) {
     canvas.setPointerCapture(event.pointerId)
+    drawing.value = true
+    error.value = ''
     context.fillStyle = 'white'
     context.arc(x, y, size / 2, 0, Math.PI * 2)
     context.fill()
@@ -90,7 +124,10 @@ function paint(event: PointerEvent, start = false) {
 }
 
 function finishStroke(event: PointerEvent) {
-  if (stroke?.pointer === event.pointerId) stroke = undefined
+  if (stroke?.pointer !== event.pointerId) return
+  stroke = undefined
+  drawing.value = false
+  recordMask(maskSnapshot())
 }
 
 async function apply() {
@@ -118,6 +155,14 @@ async function apply() {
       <div class="chips" role="group" aria-label="편집 도구">
         <button class="chip" type="button" :aria-pressed="tool === 'erase'" :disabled="saving" @click="tool = 'erase'">지우기</button>
         <button class="chip" type="button" :aria-pressed="tool === 'restore'" :disabled="saving" @click="tool = 'restore'">복원</button>
+        <button class="chip" type="button" aria-label="되돌리기" title="되돌리기"
+          :disabled="!ready || drawing || saving || historyIndex === 0" @click="moveHistory(-1)">
+          <ArrowLeft :size="18" aria-hidden="true" />
+        </button>
+        <button class="chip" type="button" aria-label="다시 실행" title="다시 실행"
+          :disabled="!ready || drawing || saving || historyIndex >= maskHistory.length - 1" @click="moveHistory(1)">
+          <ArrowRight :size="18" aria-hidden="true" />
+        </button>
       </div>
       <label class="brush-size">브러시 크기 <input v-model.number="brush" type="range" min="6" max="64" :disabled="saving"></label>
       <p v-if="!ready && !error" class="hint" role="status">편집할 사진을 여는 중이에요…</p>
@@ -126,9 +171,9 @@ async function apply() {
         @pointercancel="finishStroke" @lostpointercapture="finishStroke" />
       <p v-if="error" class="error" role="alert">{{ error }}</p>
       <div class="actions">
-        <button type="button" class="text-button" :disabled="!ready || saving" @click="reset">편집 초기화</button>
+        <button type="button" class="text-button" :disabled="!ready || drawing || saving || maskHistory[historyIndex] === initialState" @click="reset">편집 초기화</button>
         <button type="button" class="button outline small" :disabled="saving" @click="dialog?.close()">취소</button>
-        <button type="button" class="button small" :disabled="!ready || saving" @click="apply">누끼 수정 적용</button>
+        <button type="button" class="button small" :disabled="!ready || drawing || saving" @click="apply">누끼 수정 적용</button>
       </div>
     </div>
   </dialog>

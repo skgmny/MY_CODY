@@ -117,9 +117,12 @@ svg { flex-shrink: 0; }
 .saved-entry-open::after { content: ''; position: absolute; inset: 0; border-radius: inherit; }
 .saved-detail-fields { display: grid; gap: 10px; }
 .saved-detail-fields .situation-field { margin-bottom: 0; }
-.saved-detail-fields .saved-title-input { font-size: clamp(21px, 4vw, 30px); font-weight: 750; min-height: 48px; }
+.saved-detail-fields .saved-title-input { font-size: 18px; font-weight: 700; }
 .saved-title-input::placeholder { color: var(--ink); opacity: 1; }
+.look-title-count { float: right; font-weight: 500; }
+.saved-detail-notes { display: flex; flex-wrap: wrap; gap: 2px 14px; }
 .saved-memo { min-width: 0; border-top: 1px solid var(--line); padding-top: 12px; }
+.saved-memo-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .saved-memo h2 { font-size: 15px; }
 .saved-memo-toggle { display: grid; gap: 4px; min-height: 44px; width: 100%; padding: 4px 0;
   border: 0; color: inherit; background: transparent; text-align: left; }
@@ -160,6 +163,8 @@ legend span, .field span { color: var(--muted); font-size: 12px; font-weight: 50
 .field input, .field select { height: 47px; }
 .field textarea { padding-block: 9px; resize: vertical; }
 .situation-field { display: block; max-width: 280px; margin-bottom: 15px; }
+.situation-controls { display: flex; align-items: end; max-width: 410px; }
+.situation-controls > .field { min-width: 0; flex: 1 1 145px; }
 .crop-preview, .batch-preview { width: min(195px, 100%); aspect-ratio: 1; object-fit: contain; border-radius: 11px; background: #f5ece5; display: block; }
 .batch-preview { width: 100px; }
 [role="switch"][aria-checked="true"] { background: #fff0f2; color: var(--accent); border-color: #e7b8c1; }
@@ -206,4 +211,18 @@ legend span, .field span { color: var(--muted); font-size: 12px; font-weight: 50
   .home-grid { grid-template-columns: 1fr; gap: 16px; margin-top: 22px; }
   .look-grid { gap: 6px; }
   .wardrobe-grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); }
+  .saved-outfit-detail { gap: 8px; --saved-outfit-space: 328px; }
+  .content:has(> .notification) .saved-outfit-detail { --saved-outfit-space: 404px; }
+  .saved-detail-fields { gap: 6px; }
+  .saved-detail-fields .field { font-size: 13px; }
+  .saved-detail-fields .saved-title-input, .saved-detail-fields select { height: 44px; margin-top: 4px; font-size: 16px; }
+  .saved-detail-fields .situation-controls { align-items: center; }
+  .saved-detail-fields .situation-controls > .field { display: flex; gap: 8px; align-items: center; flex-basis: 120px; }
+  .saved-detail-fields .situation-controls select { margin-top: 0; min-width: 0; }
+  .saved-outfit-detail .look-photo-first {
+    --outfit-photo-space: max(140px, calc(100dvh - var(--saved-outfit-space) - env(safe-area-inset-bottom, 0px)));
+  }
+  .saved-outfit-detail .piece-top img { max-height: calc(var(--outfit-photo-space) * .31); }
+  .saved-outfit-detail .piece-bottom img { max-height: calc(var(--outfit-photo-space) * .50); }
+  .saved-outfit-detail .piece-shoes img { max-height: calc(var(--outfit-photo-space) * .19); }
 }

@@ -4,7 +4,8 @@ export const categories = ['top', 'bottom', 'shoes'] as const
 export const labels = { top: '상의', bottom: '하의', shoes: '신발' }
 export const tags = ['학교', '알바', '데이트', '모임', '운동', '격식 있는 자리', '일상'] as const
 export type Category = typeof categories[number]
-export type Tag = typeof tags[number]
+export type DefaultTag = typeof tags[number]
+export type Tag = string
 export type Selection = Record<Category, string>
 export type Item = {
   id: string

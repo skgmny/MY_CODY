@@ -1,4 +1,4 @@
-import type { Category, Tag } from './outfits'
+import type { Category, DefaultTag } from './outfits'
 
 const garments: Record<string, Category | ''> = {
   'a shirt, blouse, sweater, or jacket': 'top',
@@ -8,7 +8,7 @@ const garments: Record<string, Category | ''> = {
   'multiple clothing items': '',
   'an object that is not clothing': '',
 }
-const styles: Record<string, Tag | ''> = {
+const styles: Record<string, DefaultTag | ''> = {
   'a tracksuit, workout leggings, running shoes, or other activewear': '운동',
   'a tailored suit, dress shirt, formal skirt, or dress shoes': '격식 있는 자리',
   'a casual knit sweater, T-shirt, jeans, or everyday shoes': '일상',
