@@ -2,7 +2,7 @@ import type { ZeroShotImageClassificationPipeline } from '@huggingface/transform
 import type { InferenceSession } from 'onnxruntime-web/wasm'
 import wasmLoader from '../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs?url'
 import wasmBinary from '../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm?url'
-import { decodeImage } from './images'
+import { cutoutPreview, decodeImage, transparentPhoto } from './images'
 import { photoLabels, photoSuggestions } from './photo-suggestions'
 
 // U²-Netp by Xuebin Qin et al., Apache-2.0. ONNX weights distributed by rembg.
@@ -83,37 +83,16 @@ async function removeBackground(image: HTMLImageElement) {
   context.globalCompositeOperation = 'destination-in'
   context.drawImage(sample, 0, 0, canvas.width, canvas.height)
 
-  const alpha = context.getImageData(0, 0, canvas.width, canvas.height).data
-  let left = canvas.width, top = canvas.height, right = 0, bottom = 0, foreground = 0
-  for (let y = 0; y < canvas.height; y++) {
-    for (let x = 0; x < canvas.width; x++) {
-      if (alpha[(y * canvas.width + x) * 4 + 3]! < 110) continue
-      foreground++
-      left = Math.min(left, x)
-      right = Math.max(right, x)
-      top = Math.min(top, y)
-      bottom = Math.max(bottom, y)
-    }
-  }
-  const ratio = foreground / (canvas.width * canvas.height)
-  if (ratio < 0.02 || ratio > 0.95) throw new Error('배경을 구분하지 못했어요.')
-  const width = right - left + 1
-  const height = bottom - top + 1
-  const result = document.createElement('canvas')
-  result.width = result.height = Math.ceil(Math.max(width, height) * 1.08)
-  result.getContext('2d')!.drawImage(canvas, (result.width - width) / 2 - left, (result.height - height) / 2 - top)
-  return await new Promise<Blob>((resolve, reject) => result.toBlob(
-    blob => blob ? resolve(blob) : reject(new Error('투명 사진을 만들지 못했어요.')), 'image/webp', 0.9,
-  ))
+  return { cutout: await cutoutPreview(canvas, true), mask: await transparentPhoto(sample) }
 }
 
 export async function analyzeBackground(file: Blob) {
   try {
-    const cutout = await removeBackground(await decodeImage(file))
-    return { cutout, note: cutout ? '배경을 제거했어요.' : '이미 배경이 투명한 사진이에요.' }
+    const result = await removeBackground(await decodeImage(file))
+    return { cutout: result?.cutout, mask: result?.mask, note: result ? '배경을 제거했어요.' : '이미 배경이 투명한 사진이에요.' }
   } catch (error) {
     if (import.meta.dev) console.warn('Background model:', error)
-    return { cutout: undefined, note: '배경을 제거하지 못해 자른 사진을 표시했어요.' }
+    return { cutout: undefined, mask: undefined, note: '배경을 제거하지 못해 자른 사진을 표시했어요.' }
   }
 }
 

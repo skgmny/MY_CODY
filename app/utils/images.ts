@@ -64,3 +64,34 @@ export async function cropPhoto(file: Blob, crop: Crop, bounds?: PhotoBounds) {
     blob => blob ? resolve(blob) : reject(new Error('사진을 자르지 못했어요. 다시 시도해 주세요.')), format, 0.88,
   ))
 }
+
+export function transparentPhoto(canvas: HTMLCanvasElement) {
+  return new Promise<Blob>((resolve, reject) => canvas.toBlob(
+    blob => blob ? resolve(blob) : reject(new Error('투명 사진을 만들지 못했어요.')), 'image/webp', 0.9,
+  ))
+}
+
+export async function cutoutPreview(canvas: HTMLCanvasElement, checkCoverage = false) {
+  const { width, height } = canvas
+  const alpha = canvas.getContext('2d')!.getImageData(0, 0, width, height).data
+  let left = width, top = height, right = 0, bottom = 0, foreground = 0
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (alpha[(y * width + x) * 4 + 3]! < 110) continue
+      foreground++
+      left = Math.min(left, x)
+      right = Math.max(right, x)
+      top = Math.min(top, y)
+      bottom = Math.max(bottom, y)
+    }
+  }
+  if (!foreground) throw new Error('사진에 남긴 부분이 없어요. 복원 도구로 옷을 다시 살려 주세요.')
+  const ratio = foreground / (width * height)
+  if (checkCoverage && (ratio < 0.02 || ratio > 0.95)) throw new Error('배경을 구분하지 못했어요.')
+  const cropWidth = right - left + 1
+  const cropHeight = bottom - top + 1
+  const result = document.createElement('canvas')
+  result.width = result.height = Math.ceil(Math.max(cropWidth, cropHeight) * 1.08)
+  result.getContext('2d')!.drawImage(canvas, (result.width - cropWidth) / 2 - left, (result.height - cropHeight) / 2 - top)
+  return await transparentPhoto(result)
+}

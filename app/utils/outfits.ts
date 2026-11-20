@@ -13,6 +13,7 @@ export type Item = {
   tags: Tag[]
   original: Blob
   cutout?: Blob
+  cutoutMask?: Blob
   useCutout?: boolean
   photo: Blob
   crop?: Crop
@@ -21,7 +22,7 @@ export type Item = {
   modified: number
 }
 export type Look = { ids: Selection; situation: Tag | ''; mode: 'recommend' | 'manual' }
-export type SavedLook = Look & { id: string; saved: number }
+export type SavedLook = Look & { id: string; saved: number; title?: string; memo?: string }
 
 export function outfitPhoto(item: Pick<Item, 'original' | 'cutout' | 'useCutout' | 'photo' | 'crop' | 'sourceBounds'>) {
   const crop = item.crop

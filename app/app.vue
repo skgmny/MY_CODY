@@ -38,6 +38,7 @@ const name = ref('')
 const selectedTags = ref<Tag[]>([])
 const original = shallowRef<Blob>()
 const cutout = shallowRef<Blob>()
+const cutoutMask = shallowRef<Blob>()
 const useCutout = ref(false)
 const photo = shallowRef<Blob>()
 const sourceBounds = shallowRef<PhotoBounds>()
@@ -49,7 +50,8 @@ const photoNotes = ref<string[]>([])
 const analysis = shallowRef<AbortController>()
 const analyzingTags = ref(false)
 type PhotoDraft = { id: number; file: Blob; label: string; bounds: PhotoBounds; recrop?: boolean; error?: string }
-type BatchPhoto = PhotoDraft & { photo?: Blob; originalPreview?: Blob; cutout?: Blob; useCutout?: boolean; category: Category | ''; tags: Tag[]; notes?: string[] }
+type BatchPhoto = PhotoDraft & { photo?: Blob; originalPreview?: Blob; cutout?: Blob; cutoutMask?: Blob; useCutout?: boolean; category: Category | ''; tags: Tag[]; notes?: string[] }
+const cutoutEditor = shallowRef<{ source: Blob; mask?: Blob; row?: BatchPhoto; bounds?: PhotoBounds }>()
 const photoDrafts = ref<PhotoDraft[]>([])
 const activePhoto = ref(0)
 const activeDraft = computed(() => photoDrafts.value.find(draft => draft.id === activePhoto.value))
@@ -70,6 +72,8 @@ const pickerKind = ref<Category>()
 const outfitPicker = ref<HTMLDialogElement>()
 const preview = shallowRef<Look | SavedLook>()
 const previewPool = shallowRef<ReadonlySet<string>>()
+const lookDetails = ref<{ title: string; situation: Tag | ''; memo: string }>()
+const memoExpanded = ref(false)
 
 const recent = computed(() => saved.value.slice(0, 2))
 const wardrobe = computed(() => items.value.filter(item => filter.value === 'all' || item.category === filter.value))
@@ -179,6 +183,7 @@ function openItem(item?: Item, kind?: Category) {
   selectedTags.value = [...(item?.tags ?? [])]
   original.value = item?.original
   cutout.value = item?.cutout
+  cutoutMask.value = item?.cutoutMask
   useCutout.value = Boolean(item?.cutout && item.useCutout !== false)
   sourceBounds.value = item?.sourceBounds
   photo.value = item?.photo
@@ -225,6 +230,7 @@ async function setPhoto(draft: PhotoDraft) {
     original.value = file
     sourceBounds.value = selectedPhotoBounds(bounds)
     cutout.value = undefined
+    cutoutMask.value = undefined
     useCutout.value = false
     appliedCrop.value = defaults
     photo.value = result
@@ -236,6 +242,7 @@ async function setPhoto(draft: PhotoDraft) {
     photoNotes.value = [background?.note ?? (controller.signal.aborted ? '누끼 처리를 건너뛰었어요.' : '누끼 모델을 열지 못해 자른 사진을 표시했어요.')]
     if (background?.cutout) {
       photo.value = cutout.value = background.cutout
+      cutoutMask.value = background.mask
       useCutout.value = true
     }
     if (editId.value || draft.recrop || controller.signal.aborted) return
@@ -343,6 +350,7 @@ async function confirmPhotos() {
       if (background?.cutout) {
         row.originalPreview = row.photo
         row.photo = row.cutout = background.cutout
+        row.cutoutMask = background.mask
         row.useCutout = true
       }
     }
@@ -402,6 +410,53 @@ function toggleBatchBackground(row: BatchPhoto) {
   row.notes = [backgroundNote(enabled), ...(row.notes?.slice(1) ?? [])]
 }
 
+async function openCutoutEditor(row?: BatchPhoto) {
+  const file = row?.file ?? original.value
+  if (!file || busy.value || processing.value) return
+  const version = ++photoVersion
+  processing.value = true
+  error.value = ''
+  try {
+    const rect = photoCropRect(100, 100, appliedCrop.value, sourceBounds.value)
+    const bounds = selectedPhotoBounds(row?.bounds ?? {
+      left: rect.x, top: rect.y, right: rect.x + rect.width, bottom: rect.y + rect.height,
+    })
+    const source = row?.originalPreview ?? await cropPhoto(file, defaultCrop(), bounds)
+    let mask = row ? row.cutoutMask : cutoutMask.value
+    if (!mask && (row ? row.cutout : cutout.value)) {
+      const { analyzeBackground } = await import('~/utils/auto-photo')
+      mask = (await analyzeBackground(source)).mask
+    }
+    if (version === photoVersion) cutoutEditor.value = { source, mask, row, bounds }
+  } catch {
+    if (version === photoVersion) error.value = '누끼를 편집할 사진을 열지 못했어요. 다시 시도해 주세요.'
+  } finally {
+    if (version === photoVersion) processing.value = false
+  }
+}
+
+function applyCutout(result: Blob, mask: Blob) {
+  const editor = cutoutEditor.value
+  if (!editor) return
+  const message = '수정한 누끼를 표시했어요.'
+  if (editor.row) {
+    const row = editor.row
+    row.originalPreview = editor.source
+    row.photo = row.cutout = result
+    row.cutoutMask = mask
+    row.useCutout = true
+    row.notes = [message, ...(row.notes?.slice(1) ?? [])]
+  } else {
+    photo.value = cutout.value = result
+    cutoutMask.value = mask
+    useCutout.value = true
+    sourceBounds.value = editor.bounds
+    appliedCrop.value = defaultCrop()
+    photoNotes.value = [message, ...photoNotes.value.slice(1)]
+  }
+  cutoutEditor.value = undefined
+}
+
 async function commit(action: () => Promise<void>, success: string, next?: () => void) {
   if (busy.value) return
   busy.value = true
@@ -427,7 +482,8 @@ async function saveItem() {
   const existing = items.value.find(item => item.id === editId.value)
   const now = Date.now()
   const item: Item = { id: existing?.id ?? crypto.randomUUID(), category: category.value, name: name.value.trim(),
-    tags: [...selectedTags.value], original: original.value, cutout: cutout.value, useCutout: useCutout.value, photo: photo.value,
+    tags: [...selectedTags.value], original: original.value, cutout: cutout.value, cutoutMask: cutoutMask.value,
+    useCutout: useCutout.value, photo: photo.value,
     sourceBounds: sourceBounds.value, crop: { ...appliedCrop.value },
     created: existing?.created ?? now, modified: now }
   await commit(async () => {
@@ -450,7 +506,8 @@ async function saveBatch() {
       return
     }
     entries.push({ id: crypto.randomUUID(), category: row.category, name: '', tags: [...row.tags],
-      original: row.file, cutout: row.cutout, useCutout: row.useCutout, photo: row.photo, sourceBounds: selectedPhotoBounds(row.bounds),
+      original: row.file, cutout: row.cutout, cutoutMask: row.cutoutMask, useCutout: row.useCutout,
+      photo: row.photo, sourceBounds: selectedPhotoBounds(row.bounds),
       crop: defaultCrop(), created: now, modified: now })
   }
   await commit(async () => {
@@ -579,8 +636,28 @@ function pickManualItem(item: Item) {
 
 function openPreview(look: Look | SavedLook) {
   preview.value = look
+  lookDetails.value = undefined
+  memoExpanded.value = false
   previewPool.value = screen.value === 'manual' ? manualPool.value : undefined
   show('preview')
+}
+
+function editLookDetails(look: SavedLook) {
+  lookDetails.value = { title: look.title ?? '', situation: look.situation, memo: look.memo ?? '' }
+}
+
+async function saveLookDetails() {
+  const look = savedPreview.value
+  const details = lookDetails.value
+  if (!look || !details) return
+  const entry: SavedLook = { ...look, title: details.title.trim(), situation: details.situation, memo: details.memo.trim() }
+  await commit(async () => {
+    await write('looks', entry.id, entry)
+    saved.value = saved.value.map(current => current.id === entry.id ? entry : current)
+    preview.value = entry
+    memoExpanded.value = false
+    lookDetails.value = undefined
+  }, '코디 정보를 저장했어요.')
 }
 
 async function saveLook(look: Look) {
@@ -605,6 +682,7 @@ async function deleteLook(id: string) {
 }
 
 const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle: 'medium' }).format(date)
+const lookTitle = (look: SavedLook) => look.title || look.situation || '나의 코디'
 </script>
 
 <template>
@@ -661,14 +739,13 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
           <div class="section-heading"><h2>최근 저장한 코디</h2><button class="text-button" @click="savedFilter = 'all'; show('saved', true)">모두 보기 <ChevronRight :size="16" /></button></div>
           <div class="saved-list recent-list">
             <article v-for="look in recent" :key="look.id" class="saved-entry">
-              <h3><button class="saved-entry-open" @click="openPreview(look)">{{ look.situation || '나의 코디' }}
+              <h3><button class="saved-entry-open" @click="openPreview(look)">{{ lookTitle(look) }}
                 <ChevronRight :size="18" aria-hidden="true" />
               </button></h3>
               <LookCard :items="items" :look="look" vertical photo-first />
             </article>
           </div>
         </section>
-        <p class="privacy">옷 사진과 코디는 이 브라우저에 저장돼요. 브라우저 데이터를 지우거나 기기를 바꾸면 복구가 어려울 수 있어요.</p>
       </template>
 
       <section v-else-if="screen === 'wardrobe'">
@@ -756,6 +833,7 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
             <p v-for="note in row.notes" :key="note" class="photo-feedback" role="status">{{ note }}</p>
             <button v-if="row.cutout" class="button outline small" type="button" role="switch" aria-label="배경 제거"
               :aria-checked="Boolean(row.useCutout)" @click="toggleBatchBackground(row)">누끼 {{ row.useCutout ? '켜짐' : '꺼짐' }}</button>
+            <button v-if="row.photo" class="button outline small" type="button" @click="openCutoutEditor(row)">누끼 수정</button>
             <label class="field">품목 종류
               <select v-model="row.category" required :aria-label="'사진 ' + (i + 1) + ' 품목 종류'">
                 <option value="" disabled>종류 선택</option>
@@ -782,6 +860,7 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
               <button v-if="photo" class="button outline small" type="button" :disabled="processing" @click="startRecrop">사진 다시 자르기</button>
               <button v-if="cutout" class="button outline small" type="button" role="switch" aria-label="배경 제거"
                 :aria-checked="useCutout" :disabled="processing" @click="togglePhotoBackground">누끼 {{ useCutout ? '켜짐' : '꺼짐' }}</button>
+              <button v-if="photo" class="button outline small" type="button" :disabled="processing" @click="openCutoutEditor()">누끼 수정</button>
             </div>
             <p class="hint">{{ shareHint || '공유 메뉴에서 앱이 보이지 않으면 사진을 저장한 뒤 보관함에서 선택해 주세요.' }}</p>
             <p class="hint">카메라나 사진 보관함이 열리지 않으면 기기의 접근 권한을 확인하거나 다른 사진 입력 방법을 사용해 주세요.</p>
@@ -802,6 +881,8 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
             <button v-if="editId" class="button outline danger" type="button" :disabled="busy" @click="deleteItem">삭제</button>
           </div>
         </form>
+        <CutoutEditor v-if="cutoutEditor" :source="cutoutEditor.source" :initial-mask="cutoutEditor.mask"
+          @apply="applyCutout" @close="cutoutEditor = undefined" />
       </section>
 
       <section v-else-if="screen === 'recommend'" class="narrow">
@@ -888,12 +969,39 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
       </section>
 
       <section v-else-if="screen === 'preview' && preview" class="narrow">
-        <h1>코디 미리보기</h1>
+        <div v-if="savedPreview" class="section-heading saved-detail-heading">
+          <h1>{{ lookTitle(savedPreview) }}</h1>
+          <button v-if="!lookDetails" class="button outline small" type="button" :disabled="busy"
+            @click="editLookDetails(savedPreview)">코디 정보 수정</button>
+        </div>
+        <h1 v-else>코디 미리보기</h1>
+        <form v-if="savedPreview && lookDetails" class="form-stack saved-detail-form" @submit.prevent="saveLookDetails">
+          <label class="field">제목 <input v-model="lookDetails.title" :placeholder="lookTitle(savedPreview)" :disabled="busy"></label>
+          <label class="field">상황
+            <select v-model="lookDetails.situation" :disabled="busy">
+              <option value="">상황 미지정</option>
+              <option v-for="tag in tags" :key="tag" :value="tag">{{ tag }}</option>
+            </select>
+          </label>
+          <label class="field">메모 <textarea v-model="lookDetails.memo" rows="4" :disabled="busy" /></label>
+          <div class="actions">
+            <button class="button small" type="submit" :disabled="busy">변경사항 저장</button>
+            <button class="button outline small" type="button" :disabled="busy" @click="lookDetails = undefined; error = ''">취소</button>
+          </div>
+        </form>
         <div :class="savedPreview || preview.mode === 'manual' ? 'outfit-stage' : 'panel'">
-          <p v-if="preview.situation" class="hint">{{ preview.situation }}</p>
+          <p v-if="savedPreview" class="hint">상황 · {{ savedPreview.situation || '미지정' }}</p>
+          <p v-else-if="preview.situation" class="hint">{{ preview.situation }}</p>
           <p v-if="savedPreview" class="hint">저장한 날짜 · {{ lookDate(savedPreview.saved) }}</p>
           <LookCard :items="items" :look="preview" :vertical="Boolean(savedPreview) || preview.mode === 'manual'"
             :photo-first="Boolean(savedPreview)" editable @replace="startManual(preview, $event, previewPool)" />
+          <section v-if="savedPreview?.memo && !lookDetails" class="saved-memo" aria-labelledby="saved-memo-title">
+            <h2 id="saved-memo-title">메모</h2>
+            <button class="saved-memo-toggle" type="button" :aria-expanded="memoExpanded" @click="memoExpanded = !memoExpanded">
+              <span class="saved-memo-text" :class="{ 'memo-collapsed': !memoExpanded }">{{ savedPreview.memo }}</span>
+              <span class="memo-action">{{ memoExpanded ? '접기' : '펼치기' }}</span>
+            </button>
+          </section>
           <div class="actions">
             <button v-if="!savedPreview" class="button" :disabled="busy" @click="saveLook(preview)"><Bookmark :size="17" /> 코디 저장</button>
             <button v-else class="button outline danger" :disabled="busy" @click="deleteLook(savedPreview.id)">저장 코디 삭제</button>
@@ -930,7 +1038,7 @@ const lookDate = (date: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle:
               :disabled="busy" :aria-pressed="listSelection?.includes(look.id)"
               @click="selectListEntry($event, look.id, () => openPreview(look))" @pointerdown="startListPress($event, look.id)"
               @pointermove="moveListPress" @pointerup="stopListPress" @pointercancel="stopListPress"
-              @pointerleave="stopListPress" @contextmenu.prevent>{{ look.situation || '나의 코디' }}
+              @pointerleave="stopListPress" @contextmenu.prevent>{{ lookTitle(look) }}
               <span v-if="listSelection !== null" class="selection-check" aria-hidden="true">
                 <Check v-if="listSelection.includes(look.id)" :size="14" />
               </span>
